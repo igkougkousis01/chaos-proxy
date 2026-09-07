@@ -239,3 +239,27 @@ describe('runCli --quiet', () => {
     expect(io.stderr.join('\n')).toContain('--target');
   });
 });
+
+describe('runCli --seed', () => {
+  it('reports an empty seed as a usage mistake', async () => {
+    const io = captureIo();
+
+    await expect(runCli(['--target', 'http://127.0.0.1:1', '--seed', ''], io)).resolves.toBe(1);
+
+    expect(io.stdout).toEqual([]);
+    expect(io.stderr.join('\n')).toContain('--seed');
+    expect(io.stderr.join('\n')).toContain('Run `chaos-proxy --help` for usage.');
+  });
+
+  it('offers it in the help, as a reproducibility control rather than chaos', async () => {
+    const io = captureIo();
+
+    await expect(runCli(['--help'], io)).resolves.toBe(0);
+
+    const help = io.stdout.join('\n');
+
+    expect(help).toContain('--seed <value>');
+    expect(help).toContain('Use deterministic chaos decisions for reproducible');
+    expect(help).toContain('--seed checkout-test');
+  });
+});

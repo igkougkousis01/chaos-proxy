@@ -24,6 +24,9 @@ Chaos Proxy should eventually support:
   _(ordered path rules from a YAML config file implemented; method and host rules are not)_
 - **Request logging** — show what was forwarded, what was degraded, and why. _(one line per
   completed request implemented; the "why" — which rule matched — is not)_
+- **Reproducible runs** — replay the same chaos decisions instead of new ones every time.
+  _(implemented as `--seed`, for a given request order; scenario recording and replay files are
+  not)_
 
 ## Target users
 
@@ -66,9 +69,13 @@ src/
 ```
 
 This is a target, not a starting point. The repository deliberately keeps the minimum structure
-needed today (`src/index.ts`, `src/cli.ts`, `src/cli/`, `src/config/`, and `src/proxy/`); each
-remaining directory above is created when the feature that needs it is implemented, rather than up
-front as empty scaffolding.
+needed today (`src/index.ts`, `src/cli.ts`, `src/cli/`, `src/config/`, `src/proxy/`, and
+`src/random/`); each remaining directory above is created when the feature that needs it is
+implemented, rather than up front as empty scaffolding.
+
+`random/` was not on the list above and holds one file, `seeded.ts`, because the seeded generator
+is neither chaos behaviour nor command-line concern: the proxy core takes a `() => number`, the
+CLI turns a `--seed` string into one, and how the numbers are produced belongs to neither.
 
 `logger/` has not been created, and request logging did not warrant it: the proxy core reports a
 small event and `src/cli/log.ts` turns it into a line. A directory would be a home for a logging
@@ -90,7 +97,9 @@ chaos-proxy --target http://localhost:3000 --latency 500 --error-rate 0.2
 with Node's built-in `util.parseArgs`. Every chaos flag maps onto one `createProxyServer` option —
 the CLI checks only that a value is a number, and leaves the ranges to the proxy core, which stays
 the single authority on them. `--port` is the exception: no core validator owns it, so its range
-lives in `src/config/schema.ts`, shared by the flag and the config file's own `port`.
+lives in `src/config/schema.ts`, shared by the flag and the config file's own `port`. `--seed` is
+not a chaos flag at all — it changes where the decisions get their numbers, not what they decide —
+so it is carried separately and never reaches the chaos block.
 
 Parsing reports only what the user typed and settles nothing, because a config file may still
 supply the target, the port, or any chaos setting. `src/cli/resolve.ts` combines the two into a
@@ -133,6 +142,33 @@ and each request receives at most one injected outcome. The two rates are evalua
 during either wait, the pending timer is cancelled and nothing is decided, forwarded, or written.
 Endpoint rules change only which values those steps use; the ordering and the randomness model are
 untouched, and there is no per-rule RNG.
+
+Those two decisions are the only randomness there is, and they read it from one place: an optional
+`random` function on the server, defaulting to `Math.random`. That is the whole of the seeding
+mechanism as far as the proxy core is concerned — it knows nothing about seeds, only that it was
+handed a source of numbers in `[0, 1)`.
+
+`src/random/seeded.ts` is what the command line hands it for `--seed`. It hashes the seed string
+to a 32-bit integer with FNV-1a over the string's UTF-16 code units and steps a Mulberry32
+generator from it — both defined purely in 32-bit integer arithmetic, so the same seed yields the
+same sequence on every platform and Node version. Neither is cryptographic and neither is meant to
+be: this is a reproducibility tool. The generator's output is pinned exactly in
+`tests/random/seeded.test.ts`, which makes changing the algorithm a deliberate decision about what
+every existing seed means rather than a detail that can drift.
+
+Seeding is a command-line flag and nothing else. There is no `seed` field in the config schema,
+because a seed describes one run rather than how an API should misbehave, and a file that is
+checked in and shared is the wrong place for it. `--seed` requires a non-empty value: an empty one
+would fall back to ordinary randomness while looking exactly like a reproducible run.
+
+There is one generator per run and both decisions draw from it in order, so a request consumes one
+or two values depending on what happened to it and the sequence follows the order requests reach
+the decision. Reproducibility is therefore promised for the same request sequence in the same
+order, not for an arbitrary set of concurrent requests: two requests in flight at once may reach
+the decision in either order and swap outcomes between runs. Making that irrelevant would mean
+deriving each request's draws from the request itself, which is a different feature and not this
+one. The seed appears once in the startup summary and nowhere else — request log lines are
+unchanged, and no random value or draw counter is ever printed.
 
 Chaos is normally static, decided once when the server is created. An optional `resolveChaos` hook
 makes it request-dependent instead: it is called once per request, and what it returns is layered
@@ -190,6 +226,9 @@ statuses, method- or host-specific rules, and connection failures do not exist y
 structured or JSON logs, log files, log levels, request IDs, tracing, metrics, or naming the rule
 that matched in a log line; nor config auto-discovery, JSON config, environment variables, hot
 reload, or merging several matching rules: a config file is used only when `--config` names it.
+Nor, on the reproducibility side, do scenario recording, replay files, per-rule or per-endpoint
+seeds, per-request deterministic hashing, order-independent reproducibility, or any form of
+distributed or coordinated seeding.
 
 It is built on `node:http` and `node:https`, with `yaml` as its one runtime dependency — parsing
 YAML by hand would be a defect waiting to happen, and it is the only thing the package needs that
