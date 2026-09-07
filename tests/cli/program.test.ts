@@ -263,3 +263,44 @@ describe('runCli --seed', () => {
     expect(help).toContain('--seed checkout-test');
   });
 });
+
+describe('runCli --preset', () => {
+  it('refuses an unknown preset without starting, naming the ones that exist', async () => {
+    const io = captureIo();
+
+    await expect(
+      runCli(['--target', 'http://127.0.0.1:1', '--preset', 'terrible-network'], io),
+    ).resolves.toBe(1);
+
+    expect(io.stdout).toEqual([]);
+    expect(io.stderr.join('\n')).toContain('Unknown preset "terrible-network"');
+    expect(io.stderr.join('\n')).toContain('slow-api, flaky-api, timeout-heavy, backend-down');
+    // An expected user mistake, not a crash.
+    expect(io.stderr.join('\n')).not.toContain('at ');
+  });
+
+  it('offers the option and every preset in the help', async () => {
+    const io = captureIo();
+
+    await expect(runCli(['--help'], io)).resolves.toBe(0);
+
+    const help = io.stdout.join('\n');
+
+    expect(help).toContain('--preset <name>');
+    expect(help).toContain('Presets:');
+
+    for (const name of ['slow-api', 'flaky-api', 'timeout-heavy', 'backend-down']) {
+      expect(help).toContain(name);
+    }
+  });
+
+  it('states in the help that an explicit flag beats a preset', async () => {
+    const io = captureIo();
+
+    await runCli(['--help'], io);
+
+    expect(io.stdout.join('\n')).toContain(
+      'explicit chaos flags  >  --preset  >  config file  >  built-in defaults',
+    );
+  });
+});

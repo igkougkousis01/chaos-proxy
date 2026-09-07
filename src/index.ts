@@ -13,6 +13,12 @@
  * ordered endpoint rules — into exactly such a hook. Remaining chaos behaviour
  * (connection failures) is added in later features.
  *
+ * That command line also has built-in `--preset` names for common failure
+ * scenarios. They are deliberately not exported: a preset is a block of these
+ * very options under a name, so by the time one reaches this API it is
+ * indistinguishable from the options it stands for, and a caller here has the
+ * options themselves to hand.
+ *
  * The proxy prints nothing on its own. An optional `onRequestComplete` hook
  * reports what happened to each completed request, and the command line is what
  * turns those facts into the lines it prints.

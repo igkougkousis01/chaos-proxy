@@ -83,10 +83,21 @@ function asPercentage(rate: number): string {
  * and `--timeout`, so repeating them here would be a second copy to keep in
  * step. The chaos shown is what applies to a request no rule matches; per-rule
  * settings are left in the file rather than reprinted.
+ *
+ * Every chaos line is read off the settled options rather than off whatever
+ * asked for them, so a preset a flag has overridden is never described as
+ * though it still applied: `--preset flaky-api --error-rate 0` names the preset
+ * and then says nothing about error injection, because none happens.
  */
 function startupLines(listeningOn: string, command: ResolvedCommand): string[] {
   const { proxy } = command;
   const lines = [`${DISPLAY_NAME} listening on ${listeningOn}`, `Target: ${proxy.target}`];
+
+  // Named before the chaos it contributed, since the lines below are the only
+  // place its effect shows and one of them may well have been overridden away.
+  if (command.preset !== undefined) {
+    lines.push(`Preset: ${command.preset}`);
+  }
 
   // Named rather than summarised: which file is in effect is what someone
   // debugging unexpected chaos needs, and the file itself is right there.

@@ -301,3 +301,201 @@ describe('seeding', () => {
     expect(() => resolve(['--config', path])).toThrow('unknown field "seed"');
   });
 });
+
+/**
+ * Preset precedence, which is the whole of what a preset is:
+ *
+ *     explicit chaos flags  >  --preset  >  config file  >  built-in defaults
+ *
+ * A preset sits above everything a config file says, endpoint rules included,
+ * and below anything typed on the spot.
+ */
+describe('preset precedence', () => {
+  it('applies the preset when nothing else has an opinion', () => {
+    const command = resolve(['--target', 'http://localhost:3000', '--preset', 'flaky-api']);
+
+    expect(command.preset).toBe('flaky-api');
+    expect(command.proxy).toEqual({
+      target: 'http://localhost:3000',
+      errorRate: 0.25,
+      errorStatus: 503,
+    });
+  });
+
+  it.each([
+    ['slow-api', { latencyMs: 1000 }],
+    ['flaky-api', { errorRate: 0.25, errorStatus: 503 }],
+    ['timeout-heavy', { timeoutRate: 0.3, timeoutMs: 3000 }],
+    ['backend-down', { errorRate: 1, errorStatus: 503 }],
+  ])('resolves --preset %s to its documented chaos', (name, chaos) => {
+    const command = resolve(['--target', 'http://localhost:3000', '--preset', name]);
+
+    expect(command.proxy).toEqual({ target: 'http://localhost:3000', ...chaos });
+  });
+
+  it('reports no preset when none was given', () => {
+    expect(resolve(['--target', 'http://localhost:3000']).preset).toBeUndefined();
+  });
+
+  it('prefers the preset over the config defaults', () => {
+    const path = writeConfig('target: http://localhost:3000\ndefaults:\n  errorRate: 0.1\n');
+
+    expect(resolve(['--config', path, '--preset', 'flaky-api']).proxy.errorRate).toBe(0.25);
+  });
+
+  // The point of a preset defining only its own fields: it is a starting point
+  // for one kind of failure, not a reset of everything else.
+  it('leaves config defaults the preset does not mention alone', () => {
+    const path = writeConfig('target: http://localhost:3000\ndefaults:\n  errorRate: 0.1\n');
+    const command = resolve(['--config', path, '--preset', 'slow-api']);
+
+    expect(command.proxy).toMatchObject({ latencyMs: 1000, errorRate: 0.1 });
+  });
+
+  it('lets an explicit chaos flag beat the preset', () => {
+    const command = resolve([
+      '--target',
+      'http://localhost:3000',
+      '--preset',
+      'flaky-api',
+      '--error-rate',
+      '0.5',
+    ]);
+
+    // Only the field the flag named moves; the rest of the preset still applies.
+    expect(command.proxy).toMatchObject({ errorRate: 0.5, errorStatus: 503 });
+  });
+
+  it('lets --error-rate 0 switch a preset off entirely', () => {
+    const command = resolve([
+      '--target',
+      'http://localhost:3000',
+      '--preset',
+      'backend-down',
+      '--error-rate',
+      '0',
+    ]);
+
+    expect(command.proxy.errorRate).toBe(0);
+  });
+
+  it('stacks flag over preset over config defaults in one resolution', () => {
+    const path = writeConfig(
+      'target: http://localhost:3000\ndefaults:\n  latencyMs: 100\n  errorRate: 0.1\n  timeoutRate: 0.5\n',
+    );
+    const command = resolve(['--config', path, '--preset', 'flaky-api', '--error-status', '429']);
+
+    expect(command.proxy).toMatchObject({
+      latencyMs: 100, // config, untouched by either
+      errorRate: 0.25, // preset, over the config
+      errorStatus: 429, // flag, over the preset
+      timeoutRate: 0.5, // config, untouched by either
+    });
+  });
+});
+
+describe('presets and endpoint rules', () => {
+  const RULE_CONFIG = `target: http://localhost:3000
+
+rules:
+  - match: /api/payments/*
+    errorRate: 1
+`;
+
+  // Deliberate: a preset names the scenario being tested, so it sits above the
+  // file wholesale rather than above its defaults but beneath its rules.
+  it('applies the preset over a matching rule', () => {
+    const command = resolve(['--config', writeConfig(RULE_CONFIG), '--preset', 'flaky-api']);
+
+    expect(chaosFor(command, '/api/payments/123')).toEqual({
+      errorRate: 0.25,
+      errorStatus: 503,
+    });
+  });
+
+  it('applies the preset to requests no rule matches as well', () => {
+    const command = resolve(['--config', writeConfig(RULE_CONFIG), '--preset', 'flaky-api']);
+
+    expect(chaosFor(command, '/api/users')).toEqual({ errorRate: 0.25, errorStatus: 503 });
+    expect(command.proxy.errorRate).toBe(0.25);
+  });
+
+  it('still lets an explicit flag beat both the preset and the rule', () => {
+    const command = resolve([
+      '--config',
+      writeConfig(RULE_CONFIG),
+      '--preset',
+      'flaky-api',
+      '--error-rate',
+      '0',
+    ]);
+
+    expect(chaosFor(command, '/api/payments/123')).toEqual({ errorRate: 0, errorStatus: 503 });
+    expect(command.proxy.errorRate).toBe(0);
+  });
+
+  it('leaves a rule field the preset does not mention in place', () => {
+    const path = writeConfig(`target: http://localhost:3000
+
+rules:
+  - match: /api/search
+    timeoutRate: 1
+    timeoutMs: 50
+`);
+    const command = resolve(['--config', path, '--preset', 'slow-api']);
+
+    expect(chaosFor(command, '/api/search')).toEqual({
+      latencyMs: 1000,
+      timeoutRate: 1,
+      timeoutMs: 50,
+    });
+  });
+});
+
+describe('presets and seeding', () => {
+  // A preset is configuration and nothing else; where the numbers come from is
+  // untouched by it, so a seeded run stays exactly as reproducible as it was.
+  it('leaves the seeded generator alone', () => {
+    const seeded = resolve([
+      '--target',
+      'http://localhost:3000',
+      '--preset',
+      'flaky-api',
+      '--seed',
+      'checkout-test',
+    ]);
+    const unpreset = resolve(['--target', 'http://localhost:3000', '--seed', 'checkout-test']);
+    const withPreset = seeded.proxy.random;
+    const without = unpreset.proxy.random;
+
+    if (withPreset === undefined || without === undefined) {
+      throw new Error('expected both commands to supply a random function');
+    }
+
+    expect(seeded.seed).toBe('checkout-test');
+    expect([withPreset(), withPreset(), withPreset()]).toEqual([without(), without(), without()]);
+  });
+
+  it('leaves an unseeded run on Math.random', () => {
+    const command = resolve(['--target', 'http://localhost:3000', '--preset', 'flaky-api']);
+
+    expect('random' in command.proxy).toBe(false);
+  });
+});
+
+describe('preset immutability through resolution', () => {
+  it('does not let one resolved command change what a preset means for the next', () => {
+    const first = resolve([
+      '--target',
+      'http://localhost:3000',
+      '--preset',
+      'flaky-api',
+      '--error-rate',
+      '0.9',
+    ]);
+    const second = resolve(['--target', 'http://localhost:3000', '--preset', 'flaky-api']);
+
+    expect(first.proxy.errorRate).toBe(0.9);
+    expect(second.proxy.errorRate).toBe(0.25);
+  });
+});

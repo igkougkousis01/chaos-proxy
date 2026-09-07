@@ -27,6 +27,9 @@ Chaos Proxy should eventually support:
 - **Reproducible runs** — replay the same chaos decisions instead of new ones every time.
   _(implemented as `--seed`, for a given request order; scenario recording and replay files are
   not)_
+- **Named scenarios** — reach a common failure mode without remembering its numbers.
+  _(implemented as four built-in `--preset` values; user-defined, downloaded and composed presets
+  are not)_
 
 ## Target users
 
@@ -69,13 +72,19 @@ src/
 ```
 
 This is a target, not a starting point. The repository deliberately keeps the minimum structure
-needed today (`src/index.ts`, `src/cli.ts`, `src/cli/`, `src/config/`, `src/proxy/`, and
-`src/random/`); each remaining directory above is created when the feature that needs it is
-implemented, rather than up front as empty scaffolding.
+needed today (`src/index.ts`, `src/cli.ts`, `src/cli/`, `src/config/`, `src/presets/`,
+`src/proxy/`, and `src/random/`); each remaining directory above is created when the feature that
+needs it is implemented, rather than up front as empty scaffolding.
 
 `random/` was not on the list above and holds one file, `seeded.ts`, because the seeded generator
 is neither chaos behaviour nor command-line concern: the proxy core takes a `() => number`, the
 CLI turns a `--seed` string into one, and how the numbers are produced belongs to neither.
+
+`presets/` likewise holds one file, `index.ts`, for a similar reason in reverse: a preset is a
+block of ordinary chaos options under a name, so it is not chaos behaviour — the proxy core would
+be unable to tell a preset from the flags it stands for — and it is not command-line parsing
+either, since what a name means should not be buried in argument handling. It is a table, and it
+lives on its own.
 
 `logger/` has not been created, and request logging did not warrant it: the proxy core reports a
 small event and `src/cli/log.ts` turns it into a line. A directory would be a home for a logging
@@ -102,15 +111,42 @@ not a chaos flag at all — it changes where the decisions get their numbers, no
 so it is carried separately and never reaches the chaos block.
 
 Parsing reports only what the user typed and settles nothing, because a config file may still
-supply the target, the port, or any chaos setting. `src/cli/resolve.ts` combines the two into a
-runnable command, and owns the precedence the tool promises:
+supply the target, the port, or any chaos setting. `--preset` is carried the same way, as a name
+rather than as the chaos it stands for. `src/cli/resolve.ts` combines them into a runnable
+command, and owns the precedence the tool promises:
 
 ```text
-command-line flags  >  config file values  >  built-in defaults
+command-line flags  >  --preset  >  config file values  >  built-in defaults
 ```
 
 Chaos flags are applied last of all, so `--error-rate 0` switches error injection off everywhere,
 including inside an endpoint rule that sets it to `1`.
+
+`src/presets/index.ts` is the whole of the preset feature: a frozen table of four named blocks of
+chaos options — `slow-api`, `flaky-api`, `timeout-heavy` and `backend-down` — plus the summaries
+`--help` lists them with, rendered from the table rather than written out beside it. Presets exist
+so that trying a common failure mode does not begin with recalling that "flaky" means
+`--error-rate 0.25 --error-status 503`.
+
+Nothing downstream knows they exist. The resolver flattens the preset and the typed chaos flags
+into the single set of overrides the config layer already applies over its `defaults` and over each
+rule, so no merging logic is duplicated and the proxy core receives ordinary effective options. A
+preset therefore sits above the whole config file, endpoint rules included: it names the scenario
+being tested, and a rule that outranked it would make `--preset backend-down` mean "the backend is
+down except where the file says otherwise". Each preset sets only the fields its own scenario is
+about, so applying one leaves every unrelated setting alone — `slow-api` over a file whose
+`defaults` set `errorRate: 0.1` gives `latencyMs: 1000` and that same `errorRate`.
+
+The table is frozen at both levels and handed out as copies, so a run that layers flags over a
+preset cannot change what that preset means for the next one. Preset values are validated by the
+proxy core's own validator like any others, and a test walks all four through it, so an invalid
+built-in preset cannot ship. `--preset` is a command-line flag only, for the same reason `--seed`
+is not the config file's business in reverse: adding a `preset` field would put a second
+configuration language next to the one the file already is, with inheritance semantics to settle.
+Presets are also not part of the package's public API — a consumer of `createProxyServer` passes
+the options directly, and a name for them would be a shortcut it has no use for. Startup names the
+preset in use on its own line; the chaos lines below it are read off the settled options, so
+`--preset flaky-api --error-rate 0` reports the preset and no error injection at all.
 
 The proxy binds to `127.0.0.1` only, and that is deliberately not configurable: a tool whose
 purpose is to break traffic should never be reachable from the LAN by accident. `SIGINT` and
@@ -228,7 +264,9 @@ that matched in a log line; nor config auto-discovery, JSON config, environment 
 reload, or merging several matching rules: a config file is used only when `--config` names it.
 Nor, on the reproducibility side, do scenario recording, replay files, per-rule or per-endpoint
 seeds, per-request deterministic hashing, order-independent reproducibility, or any form of
-distributed or coordinated seeding.
+distributed or coordinated seeding. On the preset side there are no user-defined or downloaded
+presets, no preset files or remote registry, no `preset` field in the config file, no preset
+inheritance or composition, no applying two at once, and no per-rule or per-endpoint preset names.
 
 It is built on `node:http` and `node:https`, with `yaml` as its one runtime dependency — parsing
 YAML by hand would be a defect waiting to happen, and it is the only thing the package needs that
