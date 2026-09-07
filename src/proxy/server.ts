@@ -8,16 +8,19 @@ import type {
 } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 
-/** Options accepted by {@link createProxyServer}. */
-export interface ProxyServerOptions {
-  /**
-   * Absolute URL of the API to forward requests to, for example
-   * `http://localhost:5000`. Only `http:` and `https:` are supported.
-   *
-   * Only the origin is used; any path on the target is ignored.
-   */
-  readonly target: string;
-
+/**
+ * The chaos a request can be subjected to.
+ *
+ * Every field is optional, and an omitted one means "no chaos of this kind" —
+ * except {@link errorStatus} and {@link timeoutMs}, which only choose how an
+ * injected error or timeout is shaped and have their own defaults.
+ *
+ * The same shape is used for the static configuration handed to
+ * {@link createProxyServer} and for whatever a {@link ProxyServerOptions.resolveChaos}
+ * function returns for a single request, so both are validated by exactly the
+ * same rules.
+ */
+export interface ChaosOptions {
   /**
    * Fixed artificial delay, in milliseconds, applied once per request before
    * the upstream request is opened. Omitted or `0` means no delay.
@@ -60,6 +63,45 @@ export interface ProxyServerOptions {
    * waiting: a deterministic edge case rather than a useful amount of chaos.
    */
   readonly timeoutMs?: number;
+}
+
+/**
+ * A {@link ChaosOptions} with every default filled in.
+ *
+ * @internal Not part of the public API; it names what {@link resolveChaosOptions}
+ * hands back, and never appears in a signature a consumer of the package calls.
+ */
+export interface ResolvedChaosOptions {
+  readonly latencyMs: number;
+  readonly errorRate: number;
+  readonly errorStatus: number;
+  readonly timeoutRate: number;
+  readonly timeoutMs: number;
+}
+
+/** Options accepted by {@link createProxyServer}. */
+export interface ProxyServerOptions extends ChaosOptions {
+  /**
+   * Absolute URL of the API to forward requests to, for example
+   * `http://localhost:5000`. Only `http:` and `https:` are supported.
+   *
+   * Only the origin is used; any path on the target is ignored.
+   */
+  readonly target: string;
+
+  /**
+   * Optional hook that chooses the chaos for one request, so different requests
+   * can be treated differently — per-endpoint rules, for example.
+   *
+   * Whatever it returns is layered over the static chaos options above: a field
+   * it leaves out keeps the static value, and a field it sets replaces it for
+   * that request only. Nothing is mutated, and the same validation applies, so
+   * a returned value outside its documented range is rejected.
+   *
+   * The proxy core knows nothing about where these decisions come from; it is
+   * the caller's job to translate its own configuration into chaos options.
+   */
+  readonly resolveChaos?: (request: IncomingMessage) => ChaosOptions;
 }
 
 /**
@@ -149,9 +191,9 @@ function parseDurationMs(value: number | undefined, name: string, fallback: numb
  *
  * @throws {RangeError} If the rate is outside `0`-`1`, `NaN`, or infinite.
  */
-function parseRate(value: number | undefined, name: string): number {
+function parseRate(value: number | undefined, name: string, fallback: number): number {
   if (value === undefined) {
-    return 0;
+    return fallback;
   }
 
   if (!Number.isFinite(value) || value < 0 || value > 1) {
@@ -171,9 +213,9 @@ function parseRate(value: number | undefined, name: string): number {
  *
  * @throws {RangeError} If the status is not an integer in the `400`-`599` range.
  */
-function parseErrorStatus(errorStatus: number | undefined): number {
+function parseErrorStatus(errorStatus: number | undefined, fallback: number): number {
   if (errorStatus === undefined) {
-    return DEFAULT_ERROR_STATUS;
+    return fallback;
   }
 
   if (!Number.isInteger(errorStatus) || errorStatus < 400 || errorStatus > 599) {
@@ -183,6 +225,39 @@ function parseErrorStatus(errorStatus: number | undefined): number {
   }
 
   return errorStatus;
+}
+
+/** The chaos every option falls back to when nothing configures it. */
+const BUILT_IN_CHAOS: ResolvedChaosOptions = {
+  latencyMs: 0,
+  errorRate: 0,
+  errorStatus: DEFAULT_ERROR_STATUS,
+  timeoutRate: 0,
+  timeoutMs: DEFAULT_TIMEOUT_MS,
+};
+
+/**
+ * Validates `options` and fills in every value it leaves out from `base`.
+ *
+ * This is the single place chaos values are checked, whether they came from the
+ * static options, from a `resolveChaos` hook, or from a caller validating its
+ * own configuration before the server is ever created.
+ *
+ * @throws {RangeError} If any value is outside its documented range.
+ * @internal Not part of the public API; exported only so the config layer can
+ * check a file's values against the same rules before a server is created.
+ */
+export function resolveChaosOptions(
+  options: ChaosOptions,
+  base: ResolvedChaosOptions = BUILT_IN_CHAOS,
+): ResolvedChaosOptions {
+  return {
+    latencyMs: parseDurationMs(options.latencyMs, 'latencyMs', base.latencyMs),
+    errorRate: parseRate(options.errorRate, 'errorRate', base.errorRate),
+    errorStatus: parseErrorStatus(options.errorStatus, base.errorStatus),
+    timeoutRate: parseRate(options.timeoutRate, 'timeoutRate', base.timeoutRate),
+    timeoutMs: parseDurationMs(options.timeoutMs, 'timeoutMs', base.timeoutMs),
+  };
 }
 
 /**
@@ -264,9 +339,37 @@ function forwardableHeaders(headers: IncomingHttpHeaders): OutgoingHttpHeaders {
   return forwardable;
 }
 
+/**
+ * Splits an incoming request target into its path and query string.
+ *
+ * The absolute base is a placeholder that is thrown away: only what the client
+ * asked for is kept. A target Node accepted at the HTTP layer but `URL` cannot
+ * parse yields `undefined` rather than throwing, so every caller decides for
+ * itself what an unusable request target means.
+ */
+function parseRequestTarget(requestTarget: string): URL | undefined {
+  try {
+    return new URL(requestTarget, REQUEST_TARGET_BASE);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Path of an incoming request target, with any query string dropped.
+ *
+ * Exported so that callers matching requests against their own configuration
+ * see exactly the path the proxy will forward, rather than parsing `req.url` a
+ * second way. An unusable request target has no path, and so matches nothing.
+ *
+ * @internal Not part of the public API.
+ */
+export function requestPathname(requestTarget: string): string {
+  return parseRequestTarget(requestTarget)?.pathname ?? '';
+}
+
 /** Builds the upstream URL, keeping the incoming path and query string. */
-function upstreamUrlFor(requestTarget: string, target: URL): URL {
-  const incoming = new URL(requestTarget, REQUEST_TARGET_BASE);
+function upstreamUrlFor(incoming: URL, target: URL): URL {
   const upstream = new URL(target.origin);
 
   upstream.pathname = incoming.pathname;
@@ -288,15 +391,14 @@ function sendProxyError(res: ServerResponse, statusCode: number, body: string): 
 
 /** Forwards one client request upstream and streams the response back. */
 function forward(req: IncomingMessage, res: ServerResponse, target: URL): void {
-  let upstreamUrl: URL;
+  const incoming = parseRequestTarget(req.url ?? '/');
 
-  try {
-    upstreamUrl = upstreamUrlFor(req.url ?? '/', target);
-  } catch {
+  if (incoming === undefined) {
     sendProxyError(res, 400, 'Bad Request');
     return;
   }
 
+  const upstreamUrl = upstreamUrlFor(incoming, target);
   const headers = forwardableHeaders(req.headers);
   headers.host = target.host;
 
@@ -354,12 +456,19 @@ function runAfter(delayMs: number, res: ServerResponse, run: () => void): void {
   res.once('close', cancel);
 }
 
+/** Body sent when a `resolveChaos` hook cannot produce usable options. */
+const CHAOS_RESOLUTION_ERROR_BODY = 'Chaos Proxy configuration error';
+
 /**
  * Creates a proxy server that forwards every request to `target` and streams
  * the upstream response back to the client.
  *
  * The returned server is not listening yet; start it with `server.listen(port)`
  * and stop it with `server.close()`.
+ *
+ * Chaos is normally the same for every request. Passing a `resolveChaos` hook
+ * makes it request-dependent instead, by layering what the hook returns over
+ * these options; see {@link ProxyServerOptions.resolveChaos}.
  *
  * @throws {TypeError} If `target` is not an absolute `http:` or `https:` URL.
  * @throws {RangeError} If `latencyMs` or `timeoutMs` is negative, `NaN`, or
@@ -370,11 +479,8 @@ function runAfter(delayMs: number, res: ServerResponse, run: () => void): void {
  */
 export function createProxyServer(options: ProxyServerOptions): Server {
   const target = parseTarget(options.target);
-  const latencyMs = parseDurationMs(options.latencyMs, 'latencyMs', 0);
-  const errorRate = parseRate(options.errorRate, 'errorRate');
-  const errorStatus = parseErrorStatus(options.errorStatus);
-  const timeoutRate = parseRate(options.timeoutRate, 'timeoutRate');
-  const timeoutMs = parseDurationMs(options.timeoutMs, 'timeoutMs', DEFAULT_TIMEOUT_MS);
+  const staticChaos = resolveChaosOptions(options);
+  const resolveChaos = options.resolveChaos;
 
   /**
    * Starts one request, choosing exactly one outcome: a synthetic timeout, a
@@ -384,16 +490,16 @@ export function createProxyServer(options: ProxyServerOptions): Server {
    * opened and no request body is read; Node discards the unread body as part
    * of ending the response.
    */
-  function initiate(req: IncomingMessage, res: ServerResponse): void {
-    if (shouldInjectTimeout(timeoutRate)) {
-      runAfter(timeoutMs, res, () => {
+  function initiate(req: IncomingMessage, res: ServerResponse, chaos: ResolvedChaosOptions): void {
+    if (shouldInjectTimeout(chaos.timeoutRate)) {
+      runAfter(chaos.timeoutMs, res, () => {
         sendProxyError(res, INJECTED_TIMEOUT_STATUS, INJECTED_TIMEOUT_BODY);
       });
       return;
     }
 
-    if (shouldInjectError(errorRate)) {
-      sendProxyError(res, errorStatus, INJECTED_ERROR_BODY);
+    if (shouldInjectError(chaos.errorRate)) {
+      sendProxyError(res, chaos.errorStatus, INJECTED_ERROR_BODY);
       return;
     }
 
@@ -401,13 +507,28 @@ export function createProxyServer(options: ProxyServerOptions): Server {
   }
 
   return createServer((req, res) => {
-    if (latencyMs === 0) {
-      initiate(req, res);
+    let chaos: ResolvedChaosOptions;
+
+    try {
+      chaos =
+        resolveChaos === undefined
+          ? staticChaos
+          : resolveChaosOptions(resolveChaos(req), staticChaos);
+    } catch {
+      // A hook that throws or returns an unusable value is a defect in the
+      // caller's configuration, not in this request. It fails that request
+      // rather than taking the whole process down with an uncaught exception.
+      sendProxyError(res, 500, CHAOS_RESOLUTION_ERROR_BODY);
       return;
     }
 
-    runAfter(latencyMs, res, () => {
-      initiate(req, res);
+    if (chaos.latencyMs === 0) {
+      initiate(req, res, chaos);
+      return;
+    }
+
+    runAfter(chaos.latencyMs, res, () => {
+      initiate(req, res, chaos);
     });
   });
 }

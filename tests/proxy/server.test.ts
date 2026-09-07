@@ -839,3 +839,161 @@ describe('timeout injection', () => {
     await expect(response.text()).resolves.toBe('Chaos Proxy injected timeout');
   });
 });
+
+describe('per-request chaos', () => {
+  it('leaves the static options in charge when no resolver is given', async () => {
+    const upstream = await startUpstream((_req, res) => {
+      res.writeHead(200);
+      res.end('ok');
+    });
+    const proxyUrl = await startProxy(upstream.origin, { errorRate: 1, errorStatus: 503 });
+
+    const response = await fetch(`${proxyUrl}/anything`);
+
+    expect(response.status).toBe(503);
+  });
+
+  it('applies what the resolver returns to that request only', async () => {
+    const upstream = await startUpstream((_req, res) => {
+      res.writeHead(200);
+      res.end('upstream ok');
+    });
+    const { port } = await start(
+      createProxyServer({
+        target: upstream.origin,
+        resolveChaos: (request) =>
+          request.url?.startsWith('/fail') === true ? { errorRate: 1, errorStatus: 503 } : {},
+      }),
+    );
+    const proxyUrl = `http://127.0.0.1:${port}`;
+
+    const failed = await fetch(`${proxyUrl}/fail/now`);
+    const forwarded = await fetch(`${proxyUrl}/healthy`);
+
+    expect(failed.status).toBe(503);
+    await expect(failed.text()).resolves.toBe('Chaos Proxy injected error');
+    expect(forwarded.status).toBe(200);
+    await expect(forwarded.text()).resolves.toBe('upstream ok');
+    expect(upstream.requests.map((request) => request.url)).toEqual(['/healthy']);
+  });
+
+  it('is consulted once per request, with that request', async () => {
+    const upstream = await startUpstream((_req, res) => {
+      res.writeHead(200);
+      res.end('ok');
+    });
+    const seen: (string | undefined)[] = [];
+    const { port } = await start(
+      createProxyServer({
+        target: upstream.origin,
+        resolveChaos: (request) => {
+          seen.push(request.url);
+          return {};
+        },
+      }),
+    );
+
+    await fetch(`http://127.0.0.1:${port}/api/users?page=2`);
+    await fetch(`http://127.0.0.1:${port}/api/orders`);
+
+    expect(seen).toEqual(['/api/users?page=2', '/api/orders']);
+  });
+
+  it('layers what the resolver returns over the static options', async () => {
+    const upstream = await startUpstream((_req, res) => {
+      res.writeHead(200);
+      res.end('ok');
+    });
+    const { port } = await start(
+      createProxyServer({
+        target: upstream.origin,
+        errorRate: 1,
+        errorStatus: 500,
+        // Only the status is overridden; the rate the server was created with
+        // is left exactly as it was.
+        resolveChaos: () => ({ errorStatus: 503 }),
+      }),
+    );
+
+    const response = await fetch(`http://127.0.0.1:${port}/api/users`);
+
+    expect(response.status).toBe(503);
+  });
+
+  it('keeps the static options for a request the resolver says nothing about', async () => {
+    const upstream = await startUpstream((_req, res) => {
+      res.writeHead(200);
+      res.end('ok');
+    });
+    const { port } = await start(
+      createProxyServer({
+        target: upstream.origin,
+        errorRate: 1,
+        errorStatus: 503,
+        resolveChaos: () => ({}),
+      }),
+    );
+
+    const response = await fetch(`http://127.0.0.1:${port}/api/users`);
+
+    expect(response.status).toBe(503);
+  });
+
+  it('applies resolved latency before deciding anything else', async () => {
+    const upstream = await startUpstream((_req, res) => {
+      res.writeHead(200);
+      res.end('ok');
+    });
+    const { port } = await start(
+      createProxyServer({
+        target: upstream.origin,
+        resolveChaos: () => ({ latencyMs: 200, errorRate: 1, errorStatus: 503 }),
+      }),
+    );
+
+    const startedAt = performance.now();
+    const response = await fetch(`http://127.0.0.1:${port}/api/users`);
+    const elapsed = performance.now() - startedAt;
+
+    expect(response.status).toBe(503);
+    expect(elapsed).toBeGreaterThanOrEqual(150);
+    expect(upstream.connectionCount()).toBe(0);
+  });
+
+  // A misbehaving resolver is a defect in the caller's configuration, not a
+  // reason to take the whole process down with an uncaught exception.
+  it.each([
+    ['returns a value out of range', () => ({ errorRate: 5 })],
+    [
+      'throws',
+      () => {
+        throw new Error('resolver exploded');
+      },
+    ],
+  ])('answers 500 when the resolver %s, and stays up', async (_what, resolveChaos) => {
+    const upstream = await startUpstream((_req, res) => {
+      res.writeHead(200);
+      res.end('upstream ok');
+    });
+    let broken = true;
+    const { port } = await start(
+      createProxyServer({
+        target: upstream.origin,
+        resolveChaos: () => (broken ? resolveChaos() : {}),
+      }),
+    );
+    const proxyUrl = `http://127.0.0.1:${port}`;
+
+    const failed = await fetch(`${proxyUrl}/api/users`);
+
+    expect(failed.status).toBe(500);
+    await expect(failed.text()).resolves.toBe('Chaos Proxy configuration error');
+    expect(upstream.connectionCount()).toBe(0);
+
+    broken = false;
+    const recovered = await fetch(`${proxyUrl}/api/users`);
+
+    expect(recovered.status).toBe(200);
+    await expect(recovered.text()).resolves.toBe('upstream ok');
+  });
+});

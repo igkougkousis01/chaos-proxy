@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { CliError, DEFAULT_PORT, inFlagTerms, parseCliArgs } from '../../src/cli/options.js';
+import { CliError, inFlagTerms, parseCliArgs } from '../../src/cli/options.js';
 
 const TARGET = 'http://localhost:3000';
 
@@ -16,15 +16,27 @@ function parseRun(argv: readonly string[]) {
 }
 
 describe('parseCliArgs', () => {
-  it('needs only a target, and defaults the port', () => {
+  it('reports only what was typed, leaving the rest for the config file', () => {
     const command = parseRun(['--target', TARGET]);
 
-    expect(command.port).toBe(DEFAULT_PORT);
-    expect(command.proxy).toEqual({ target: TARGET });
+    expect(command).toEqual({
+      target: TARGET,
+      configPath: undefined,
+      port: undefined,
+      chaos: {},
+    });
   });
 
   it('accepts the --option=value form', () => {
-    expect(parseRun([`--target=${TARGET}`]).proxy.target).toBe(TARGET);
+    expect(parseRun([`--target=${TARGET}`]).target).toBe(TARGET);
+  });
+
+  it('reports the path given to --config', () => {
+    expect(parseRun(['--config', './chaos.yml']).configPath).toBe('./chaos.yml');
+  });
+
+  it('does not require --target when a config file may supply one', () => {
+    expect(parseRun(['--config', 'chaos.yml']).target).toBeUndefined();
   });
 
   it('maps every chaos flag onto its proxy option', () => {
@@ -46,8 +58,8 @@ describe('parseCliArgs', () => {
     ]);
 
     expect(command.port).toBe(4100);
-    expect(command.proxy).toEqual({
-      target: TARGET,
+    expect(command.target).toBe(TARGET);
+    expect(command.chaos).toEqual({
       latencyMs: 500,
       errorRate: 0.2,
       errorStatus: 503,
@@ -56,12 +68,12 @@ describe('parseCliArgs', () => {
     });
   });
 
-  it('leaves options that were not given off entirely, so the core defaults apply', () => {
+  it('leaves flags that were not given off entirely, so config or core defaults apply', () => {
     const command = parseRun(['--target', TARGET, '--error-rate', '0.5']);
 
-    expect(command.proxy).toEqual({ target: TARGET, errorRate: 0.5 });
-    expect('errorStatus' in command.proxy).toBe(false);
-    expect('latencyMs' in command.proxy).toBe(false);
+    expect(command.chaos).toEqual({ errorRate: 0.5 });
+    expect('errorStatus' in command.chaos).toBe(false);
+    expect('latencyMs' in command.chaos).toBe(false);
   });
 
   it.each([['--help'], ['-h']])('reports %s, even without a target', (flag) => {
@@ -83,6 +95,15 @@ describe('parseCliArgs', () => {
       expect(() => parseCliArgs(argv)).toThrow(/--target/);
     },
   );
+
+  // The config file cannot supply a target the user explicitly blanked out.
+  it('rejects an empty --target even alongside --config', () => {
+    expect(() => parseCliArgs(['--config', 'chaos.yml', '--target='])).toThrow(/--target/);
+  });
+
+  it('rejects an empty --config', () => {
+    expect(() => parseCliArgs(['--config='])).toThrow(/--config/);
+  });
 
   it('rejects an unknown option', () => {
     expect(() => parseCliArgs(['--target', TARGET, '--chaos'])).toThrow(/--chaos/);
@@ -142,7 +163,7 @@ describe('parseCliArgs', () => {
   });
 
   it('leaves a target that is not a URL to the proxy core', () => {
-    expect(parseRun(['--target', 'localhost:3000']).proxy.target).toBe('localhost:3000');
+    expect(parseRun(['--target', 'localhost:3000']).target).toBe('localhost:3000');
   });
 });
 

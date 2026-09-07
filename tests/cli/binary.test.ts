@@ -1,9 +1,11 @@
 import { execFile, spawn } from 'node:child_process';
 import type { ChildProcessByStdio } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import type { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
@@ -41,6 +43,7 @@ interface CliProcess {
 
 const running = new Set<CliProcess>();
 const openServers = new Set<Server>();
+const tempDirs: string[] = [];
 
 afterEach(async () => {
   const children = [...running];
@@ -65,7 +68,25 @@ afterEach(async () => {
         }),
     ),
   );
+
+  while (tempDirs.length > 0) {
+    const dir = tempDirs.pop();
+
+    if (dir !== undefined) {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
 });
+
+/** Writes a config file that is removed after the test that made it. */
+function writeTempConfig(contents: string): string {
+  const dir = mkdtempSync(join(tmpdir(), 'chaos-proxy-cli-'));
+  tempDirs.push(dir);
+  const path = join(dir, 'chaos.yml');
+  writeFileSync(path, contents, 'utf8');
+
+  return path;
+}
 
 /** Spawns the built CLI, capturing both streams. */
 function startCli(args: readonly string[]): CliProcess {
@@ -357,4 +378,92 @@ describe('the built CLI', () => {
     await expect(response.text()).resolves.toBe('Chaos Proxy injected error');
     expect(upstream.requests).toHaveLength(0);
   }, 30_000);
+});
+
+describe('the built CLI with --config', () => {
+  it('serves endpoint rules from a YAML file and forwards everything else', async () => {
+    const upstream = await startUpstream();
+    const configPath = writeTempConfig(`target: ${upstream.origin}
+
+rules:
+  - match: /fail/*
+    errorRate: 1
+    errorStatus: 503
+`);
+    const port = await findFreePort();
+    const cli = startCli(['--config', configPath, '--port', String(port)]);
+    await waitForOutput(cli, 'Rules: 1');
+
+    expect(cli.stdout()).toContain(`Config: ${configPath}`);
+    expect(cli.stdout()).toContain(`Target: ${upstream.origin}`);
+
+    const baseUrl = `http://127.0.0.1:${port}`;
+    const healthy = await fetch(`${baseUrl}/healthy`);
+
+    expect(healthy.status).toBe(200);
+    await expect(healthy.text()).resolves.toBe('upstream ok');
+
+    const failed = await fetch(`${baseUrl}/fail/test`);
+
+    expect(failed.status).toBe(503);
+    await expect(failed.text()).resolves.toBe('Chaos Proxy injected error');
+
+    // Only the healthy request ever reached the upstream.
+    expect(upstream.requests.map((request) => request.url)).toEqual(['/healthy']);
+
+    cli.child.kill('SIGINT');
+    await expect(cli.exit).resolves.toMatchObject({ code: 0, signal: null });
+  }, 30_000);
+
+  it('lets --port and a chaos flag override the config file', async () => {
+    const upstream = await startUpstream();
+    const configPath = writeTempConfig(`target: ${upstream.origin}
+
+port: 1
+
+rules:
+  - match: /fail/*
+    errorRate: 1
+    errorStatus: 503
+`);
+    const port = await findFreePort();
+    const cli = startCli(['--config', configPath, '--port', String(port), '--error-rate', '0']);
+    await waitForOutput(cli, 'Rules: 1');
+
+    // Port 1 from the config would never have bound, and the rule's certain
+    // failure is switched off by the flag.
+    expect(cli.stdout()).toContain(`http://127.0.0.1:${port}`);
+
+    const response = await fetch(`http://127.0.0.1:${port}/fail/test`);
+
+    expect(response.status).toBe(200);
+    await expect(response.text()).resolves.toBe('upstream ok');
+
+    cli.child.kill('SIGINT');
+    await expect(cli.exit).resolves.toMatchObject({ code: 0 });
+  }, 30_000);
+
+  it('fails cleanly on a config file that is not there', async () => {
+    const cli = startCli(['--config', join(tmpdir(), 'chaos-proxy-does-not-exist.yml')]);
+
+    const { code } = await cli.exit;
+
+    expect(code).toBe(1);
+    expect(cli.stdout()).toBe('');
+    expect(cli.stderr()).toContain('Config file not found');
+    // An expected user mistake, not a crash.
+    expect(cli.stderr()).not.toContain('at ');
+  }, 20_000);
+
+  it('fails cleanly on an invalid config file', async () => {
+    const configPath = writeTempConfig('target: http://localhost:3000\nrules:\n  - errorRate: 1\n');
+    const cli = startCli(['--config', configPath]);
+
+    const { code } = await cli.exit;
+
+    expect(code).toBe(1);
+    expect(cli.stdout()).toBe('');
+    expect(cli.stderr()).toContain('rules[0] is missing the required "match" field');
+    expect(cli.stderr()).not.toContain('at ');
+  }, 20_000);
 });
