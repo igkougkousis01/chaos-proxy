@@ -64,20 +64,43 @@ src/
 ```
 
 This is a target, not a starting point. The repository deliberately keeps the minimum structure
-needed today (`src/index.ts`, `src/cli.ts`, and `src/proxy/`); each remaining directory above is
-created when the feature that needs it is implemented, rather than up front as empty scaffolding.
+needed today (`src/index.ts`, `src/cli.ts`, `src/cli/`, and `src/proxy/`); each remaining
+directory above is created when the feature that needs it is implemented, rather than up front as
+empty scaffolding.
 
 ## Current status
 
 The repository is bootstrapped with the Node.js + TypeScript toolchain (ESM, Vitest, ESLint,
-Prettier) and a placeholder CLI entry point that prints the tool name.
+Prettier).
+
+`src/cli/` implements the command-line interface, which is how the tool is normally used:
+
+```bash
+chaos-proxy --target http://localhost:3000 --latency 500 --error-rate 0.2
+```
+
+`src/cli.ts` is the executable entry point and does nothing but call `runCli`, which lives in
+`src/cli/program.ts` alongside startup and shutdown; `src/cli/options.ts` parses the command line
+with Node's built-in `util.parseArgs`, so there are still no runtime dependencies. Every chaos
+flag maps onto one `createProxyServer` option — the CLI checks only that a value is a number, and
+leaves the ranges to the proxy core, which stays the single authority on them. `--port` is the
+exception: no core validator owns it, so the CLI rejects anything that is not an integer from 1
+to 65535.
+
+The proxy binds to `127.0.0.1` only, and that is deliberately not configurable: a tool whose
+purpose is to break traffic should never be reachable from the LAN by accident. `SIGINT` and
+`SIGTERM` stop it by closing the listener and releasing idle keep-alive sockets, letting requests
+in flight finish rather than cutting them off. Usage mistakes, options the core rejects, and a
+port that is already in use are all reported as a single readable line and a non-zero exit code,
+without a stack trace; unexpected errors are still allowed to surface normally.
 
 `src/proxy/` implements the forwarding layer: `createProxyServer({ target })` returns a Node.js
 `http.Server` that streams requests through to an `http:` or `https:` target and streams the
 upstream response back, preserving method, path, query string, body, and headers. Unreachable
 targets produce a `502 Bad Gateway` instead of crashing the process.
 
-The chaos behaviour implemented so far also lives there, and is programmatic only:
+The chaos behaviour implemented so far also lives there, and each part of it is reachable
+from the CLI:
 
 - `latencyMs` adds a fixed artificial delay before the upstream request is opened, leaving body
   streaming untouched.
@@ -94,7 +117,8 @@ and each request receives at most one injected outcome. The two rates are evalua
 during either wait, the pending timer is cancelled and nothing is decided, forwarded, or written.
 
 Randomised or ranged delays and timeout durations, choosing between multiple or weighted error
-statuses, per-endpoint or per-method rules, connection failures, configuration loading, and CLI
-argument parsing do not exist yet.
+statuses, per-endpoint or per-method rules, connection failures, and request logging do not exist
+yet. Configuration is CLI flags only: config files (`src/config/`), environment variables, and
+`.chaosrc`-style auto-discovery remain planned rather than implemented.
 
 It is built on `node:http` and `node:https` with no runtime dependencies.
