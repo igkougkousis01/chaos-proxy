@@ -292,6 +292,19 @@ function parseTarget(target: string): URL {
 }
 
 /**
+ * Validates a proxy target without building anything from it.
+ *
+ * @throws {TypeError} If the target is not an absolute `http:` or `https:` URL.
+ * @internal Not part of the public API; exported for the same reason
+ * {@link resolveChaosOptions} is, so that the command line can check a settled
+ * target against these very rules before any server exists — `--print-config`
+ * has to refuse a configuration that could not actually run.
+ */
+export function assertValidTarget(target: string): void {
+  parseTarget(target);
+}
+
+/**
  * Validates one of the configured durations and applies its default.
  *
  * @throws {RangeError} If the duration is negative, `NaN`, or infinite.

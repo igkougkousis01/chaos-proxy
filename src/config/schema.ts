@@ -11,10 +11,37 @@ import { describeMatchPattern } from './rules.js';
  * instead of letting a stack trace out.
  */
 export class ConfigError extends Error {
-  constructor(message: string) {
+  /**
+   * What was wrong, without the framing that names the file around it.
+   *
+   * Kept apart from the message so that the same problem can be re-reported
+   * against the file it was found in, once that is known. Validation works on a
+   * parsed document and deliberately knows nothing about where it came from, so
+   * the path is added by whoever read the file rather than threaded through
+   * every check. A problem that has no such wording — a file that could not be
+   * read, say, whose message already names the path — leaves this `undefined`.
+   */
+  readonly problem: string | undefined;
+
+  constructor(message: string, problem?: string) {
     super(message);
     this.name = 'ConfigError';
+    this.problem = problem;
   }
+}
+
+/**
+ * The same problem, reported as having been found in `source`.
+ *
+ * Naming the file matters more than it used to: with `./chaos.yml` picked up
+ * automatically, the file a message is about may be one the user never typed.
+ */
+export function configErrorIn(error: ConfigError, source: string): ConfigError {
+  if (error.problem === undefined) {
+    return error;
+  }
+
+  return new ConfigError(`Invalid config in ${source}: ${error.problem}`, error.problem);
 }
 
 /** One endpoint rule: a path pattern plus the chaos it applies. */
@@ -72,9 +99,17 @@ const CHAOS_FIELDS = [
 /** Fields one entry of `rules` may contain. */
 const RULE_FIELDS = ['match', ...CHAOS_FIELDS] as const;
 
-/** @throws {ConfigError} Always; the return type only helps control flow. */
+/**
+ * Reports a problem with the file's contents, and never returns.
+ *
+ * Every message is built here and every one of them opens with where the
+ * problem is — `defaults.errorRate`, `rules[2].match` — so a caller writes the
+ * path once and nothing has to repeat the framing around it.
+ *
+ * @throws {ConfigError} Always; the return type only helps control flow.
+ */
 function invalid(problem: string): never {
-  throw new ConfigError(`Invalid config: ${problem}`);
+  throw new ConfigError(`Invalid config: ${problem}`, problem);
 }
 
 /** Whether `value` is a YAML mapping rather than a list or a scalar. */
@@ -92,11 +127,16 @@ function isMapping(value: unknown): value is Record<string, unknown> {
 function assertKnownFields(
   mapping: Record<string, unknown>,
   known: readonly string[],
-  where: string,
+  path?: string,
 ): void {
   for (const field of Object.keys(mapping)) {
     if (!known.includes(field)) {
-      invalid(`unknown field ${JSON.stringify(field)}${where}.`);
+      const where = path === undefined ? 'unknown field' : `${path} contains unknown field`;
+
+      // The alternatives are listed because the mistake is almost always a
+      // misspelling, and the answer is a short closed set the user should not
+      // have to leave the terminal to find.
+      invalid(`${where} ${JSON.stringify(field)}. Known fields: ${known.join(', ')}.`);
     }
   }
 }
@@ -164,10 +204,10 @@ function readDefaults(value: unknown): ChaosOptions {
   }
 
   if (!isMapping(value)) {
-    invalid('"defaults" must be a mapping of chaos settings.');
+    invalid('defaults must be a mapping of chaos settings, such as "latencyMs: 250".');
   }
 
-  assertKnownFields(value, CHAOS_FIELDS, ' in "defaults"');
+  assertKnownFields(value, CHAOS_FIELDS, 'defaults');
 
   return readChaosFields(value, 'defaults');
 }
@@ -179,7 +219,7 @@ function readRules(value: unknown): readonly ChaosRuleConfig[] {
   }
 
   if (!Array.isArray(value)) {
-    invalid('"rules" must be a list of rules.');
+    invalid('rules must be a list of rules, each of them a mapping with a "match".');
   }
 
   return (value as readonly unknown[]).map((entry, index) => {
@@ -189,7 +229,7 @@ function readRules(value: unknown): readonly ChaosRuleConfig[] {
       invalid(`${path} must be a mapping with a "match" field.`);
     }
 
-    assertKnownFields(entry, RULE_FIELDS, ` in ${path}`);
+    assertKnownFields(entry, RULE_FIELDS, path);
 
     const match = entry.match;
 
@@ -218,11 +258,11 @@ function readTarget(value: unknown): string | undefined {
   }
 
   if (typeof value !== 'string') {
-    invalid('"target" must be a string.');
+    invalid('target must be a string, for example "http://localhost:3000".');
   }
 
   if (value === '') {
-    invalid('"target" must not be empty.');
+    invalid('target must not be empty.');
   }
 
   return value;
@@ -235,7 +275,7 @@ function readPort(value: unknown): number | undefined {
   }
 
   if (typeof value !== 'number' || !isValidPort(value)) {
-    invalid(`"port" must be an integer between ${PORT_MIN} and ${PORT_MAX}.`);
+    invalid(`port must be an integer between ${PORT_MIN} and ${PORT_MAX}.`);
   }
 
   return value;
@@ -256,7 +296,7 @@ export function parseConfig(document: unknown): ChaosConfig {
     invalid('the file must contain a YAML mapping, for example "target: http://localhost:3000".');
   }
 
-  assertKnownFields(document, TOP_LEVEL_FIELDS, '');
+  assertKnownFields(document, TOP_LEVEL_FIELDS);
 
   return {
     target: readTarget(document.target),

@@ -68,6 +68,15 @@ export interface CliCommand {
   readonly seed: string | undefined;
   /** Whether `--quiet` was given, silencing everything but errors. */
   readonly quiet: boolean;
+  /**
+   * Whether `--print-config` was given, asking for the settled configuration
+   * instead of a running proxy.
+   *
+   * Carried alongside a perfectly ordinary run rather than as a mode of its
+   * own, because it needs everything a run needs: the same flags, the same
+   * config file and the same precedence. Only the last step differs.
+   */
+  readonly printConfig: boolean;
 }
 
 /**
@@ -91,6 +100,7 @@ Options:
   --target <url>            API to forward to (http: or https:). Required
                             unless the config file supplies it.
   --config <path>           YAML config file with defaults and endpoint rules.
+                            Default: ./chaos.yml, when that file exists.
   --preset <name>           Use a built-in chaos preset. See Presets below.
   --port <1-65535>          Port to listen on. Default: ${DEFAULT_PORT}.
   --latency <ms>            Fixed delay added to every request.
@@ -103,6 +113,8 @@ Options:
   --seed <value>            Use deterministic chaos decisions for reproducible
                             test runs.
   --quiet                   Print nothing but errors, which still go to stderr.
+  --print-config            Print the resolved configuration and exit, without
+                            starting the proxy.
   -h, --help                Show this help.
   -v, --version             Show the version.
 
@@ -121,7 +133,13 @@ Every completed request prints one line, unless --quiet is given:
   12:41:11 GET    /api/cart -> RESET 12ms connection:reset
 
 A config file adds per-endpoint rules; the first rule whose "match" fits the
-request path wins.
+request path wins. ./chaos.yml in the current directory is loaded automatically
+when --config is not given; an explicit --config always wins over it, and fails
+rather than falling back if the file it names is not there.
+
+--print-config settles everything — flags, preset, config file, defaults — and
+prints the configuration the proxy would run with, then exits without listening
+on anything. --quiet does not suppress it.
 
 Presets:
 ${PRESET_HELP}
@@ -145,7 +163,9 @@ Examples:
 
   ${CLI_NAME} --target http://localhost:3000 --preset flaky-api
 
-  ${CLI_NAME} --config chaos.yml`;
+  ${CLI_NAME} --config chaos.yml
+
+  ${CLI_NAME} --preset flaky-api --error-rate 0.5 --print-config`;
 
 /** Pointer appended to usage errors, so the user knows where to look. */
 export const USAGE_HINT = `Run \`${CLI_NAME} --help\` for usage.`;
@@ -278,6 +298,7 @@ export function parseCliArgs(argv: readonly string[]): ParsedCli {
         'reset-rate': { type: 'string' },
         seed: { type: 'string' },
         quiet: { type: 'boolean' },
+        'print-config': { type: 'boolean' },
         help: { type: 'boolean', short: 'h' },
         version: { type: 'boolean', short: 'v' },
       },
@@ -308,14 +329,9 @@ export function parseCliArgs(argv: readonly string[]): ParsedCli {
     );
   }
 
-  // Without a config file there is nowhere else a target could come from, so
-  // the mistake is worth reporting straight away. With one, the check waits
-  // until the file has been read.
-  if (target === undefined && configPath === undefined) {
-    throw new CliError(
-      'Missing required option --target, for example --target http://localhost:3000.',
-    );
-  }
+  // A missing target is not decided here. Without `--config` there may still be
+  // a `./chaos.yml` to pick up, and only the resolver knows whether there is,
+  // so the complaint waits until config discovery has had its say.
 
   const seed = values.seed;
 
@@ -364,6 +380,7 @@ export function parseCliArgs(argv: readonly string[]): ParsedCli {
       preset: preset === undefined ? undefined : toPreset(preset),
       seed,
       quiet: values.quiet === true,
+      printConfig: values['print-config'] === true,
     },
   };
 }

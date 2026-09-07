@@ -68,7 +68,7 @@ describe('resolveCommand without a config file', () => {
   it('passes the flags straight through, with the default port', () => {
     const command = resolve(['--target', 'http://localhost:3000', '--latency', '500']);
 
-    expect(command).toEqual({
+    expect(command).toMatchObject({
       port: DEFAULT_PORT,
       proxy: { target: 'http://localhost:3000', latencyMs: 500 },
       configPath: undefined,
@@ -323,7 +323,9 @@ describe('config failures', () => {
   it('surfaces an invalid config before anything is resolved', () => {
     const path = writeConfig('target: http://localhost:3000\nfoo: 1\n');
 
-    expect(() => resolve(['--config', path])).toThrow('Invalid config: unknown field "foo".');
+    expect(() => resolve(['--config', path])).toThrow(
+      `Invalid config in ${path}: unknown field "foo".`,
+    );
   });
 });
 

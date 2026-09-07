@@ -105,7 +105,9 @@ chaos-proxy --target http://localhost:3000 --latency 500 --error-rate 0.2
 
 `src/cli.ts` is the executable entry point and does nothing but call `runCli`, which lives in
 `src/cli/program.ts` alongside startup and shutdown; `src/cli/options.ts` parses the command line
-with Node's built-in `util.parseArgs`. Every chaos flag maps onto one `createProxyServer` option —
+with Node's built-in `util.parseArgs`. A missing `--target` is deliberately not diagnosed there:
+a `./chaos.yml` may still supply one, and only the resolver knows whether such a file exists, so
+the complaint waits until config discovery has had its say. Every chaos flag maps onto one `createProxyServer` option —
 the CLI checks only that a value is a number, and leaves the ranges to the proxy core, which stays
 the single authority on them. `--port` is the exception: no core validator owns it, so its range
 lives in `src/config/schema.ts`, shared by the flag and the config file's own `port`. `--seed` is
@@ -126,6 +128,31 @@ including inside an endpoint rule that sets it to `1`. `--reset-rate` is an ordi
 exactly those terms, and `resetRate` is an ordinary config field: unlike `--seed` and `--preset` it
 describes how an API should misbehave rather than how one run should be driven, so it belongs in a
 file that is checked in and shared.
+
+Which config file that is comes from `src/config/discover.ts`: an explicit `--config`, otherwise a
+`chaos.yml` in the working directory, otherwise none. Resolution therefore starts by asking one
+helper where the config is rather than by testing for files itself, and the proxy core still knows
+nothing about file names, working directories, YAML or discovery.
+
+Resolution produces two things from one pass: the options `createProxyServer` is handed, and a
+normalised description of what those options mean. The description — `EffectiveConfig` — is the
+settled target, port, config path, preset and seed, plus the complete chaos a request receives when
+no rule matches and the complete chaos each rule applies. It is derived by running the proxy core's
+own `resolveChaosOptions` over the very same merged chaos the running server gets, in the same two
+steps the server takes it in, so it is a rendering of the run rather than a second opinion about
+it. There is one precedence implementation, and `--print-config` reads it rather than repeating it.
+
+`--print-config` prints that description as YAML on stdout and exits `0`, having created no server,
+bound no port and contacted no upstream. It goes through everything an ordinary run goes through
+first, so a missing target, an unusable config file, or a chaos value the core rejects fails on
+stderr exactly as it would have on a real run rather than printing a configuration that could not
+have started. `src/cli/print.ts` is the whole of the rendering: it fixes the key order, prints every
+value including the zeroes and the defaults nothing configured, and prints `null` for an absent
+config, preset or seed — consistency is worth more than compactness in output whose entire purpose
+is answering "what will this actually do". It is a view of a run and not a formatter: comments,
+ordering and formatting from the source file are gone, nothing is written back to disk, and there
+are no `--init`, `--write-config` or `--migrate-config` commands to go with it. `--quiet` does not
+suppress it, because `--quiet` silences what the CLI volunteers rather than what it was asked for.
 
 The startup summary reports `Connection resets: <rate>` when the settled global rate is above zero,
 and says nothing when it is not — the same rule the other chaos lines follow. Like them it
@@ -272,15 +299,29 @@ since neither is one of the four fates a request it understood can meet.
 
 `src/config/` implements the YAML config file, and is the only consumer of that hook:
 
+- `discover.ts` decides which file, if any, this run should read: an explicit `--config` path,
+  otherwise `./chaos.yml` if it is there, otherwise nothing. It is the only place the filesystem is
+  consulted about where a config lives, and it always answers with an absolute path. An explicit
+  path is returned whether or not anything is at it, so `--config` naming a missing file fails
+  rather than falling back — a silent fallback would run a configuration nobody asked for and look
+  like success. The conventional file's absence is not an error, and no other name, and no other
+  directory, is ever looked at.
 - `load.ts` reads the file — resolving a relative path against the working directory — and runs it
   through the YAML parser, turning a missing file, a directory, an unreadable file, or a syntax
-  error into a plain one-line message.
+  error into a plain one-line message. It is also where a schema complaint acquires the path it was
+  found in, so validation stays a function of a parsed document while its messages still name a
+  file. That matters more now that the file in effect may be one the user never typed.
 - `schema.ts` validates the parsed document. The schema is `target`, `port`, `defaults` and
   `rules`, and nothing else: an unknown field at any level is an error rather than something to
   ignore, since a misspelled `errorRate` that is silently dropped looks exactly like chaos that
-  does not work. Chaos values are handed to the proxy core's own validator and its complaint is
-  re-worded with the path in the file, so the config file can never accept a value the
-  programmatic API rejects.
+  does not work — and the message lists the fields that do exist, because the mistake is almost
+  always a misspelling and the answer is a short closed set. Every message opens with where the
+  problem is, `defaults.errorRate` or `rules[2].match`, before saying what it is. Chaos values are
+  handed to the proxy core's own validator and its complaint is re-worded with the path in the
+  file, so the config file can never accept a value the programmatic API rejects. There is no
+  third-party validation library and no second schema language: `ConfigError` carries the problem
+  apart from the rendered message, which is the whole of the machinery needed to re-report it
+  against a path.
 - `rules.ts` owns matching and merging. A `match` is either an exact path or a trailing `/*`
   prefix; anything else — a `*` in the middle, `**`, a regular expression, a query string — is
   rejected when the file is read. Matching uses the request pathname the proxy already parses for
@@ -303,8 +344,12 @@ one is not: refusing connections outright, resetting part-way through a request 
 half-open sockets, configurable or per-rule reset timing, packet loss, bandwidth throttling, and
 upstream-side connection failures after forwarding has begun. Neither do
 structured or JSON logs, log files, log levels, request IDs, tracing, metrics, or naming the rule
-that matched in a log line; nor config auto-discovery, JSON config, environment variables, hot
-reload, or merging several matching rules: a config file is used only when `--config` names it.
+that matched in a log line; nor JSON or TOML config, environment variables or `${VAR}`
+interpolation, remote or URL config, multiple config files, includes, inheritance, hot reload, file
+watching, or merging several matching rules. Config discovery is deliberately the narrowest rule
+that is useful: `./chaos.yml` and nothing else — no `chaos.yaml`, no `.chaos.yml`, no
+parent-directory walk, no home directory, and no `package.json` — so which file a run used is
+always a single unambiguous answer, and `--print-config` prints it.
 Nor, on the reproducibility side, do scenario recording, replay files, per-rule or per-endpoint
 seeds, per-request deterministic hashing, order-independent reproducibility, or any form of
 distributed or coordinated seeding. On the preset side there are no user-defined or downloaded

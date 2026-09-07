@@ -1,7 +1,10 @@
 import { createServer } from 'node:http';
 import type { Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { parse as parseYaml } from 'yaml';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { runCli } from '../../src/cli/program.js';
@@ -30,8 +33,17 @@ function captureIo(): CapturedIo {
 }
 
 const openServers = new Set<Server>();
+const tempDirs: string[] = [];
 
 afterEach(async () => {
+  while (tempDirs.length > 0) {
+    const dir = tempDirs.pop();
+
+    if (dir !== undefined) {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
   const servers = [...openServers];
   openServers.clear();
   await Promise.all(
@@ -335,5 +347,161 @@ describe('runCli --preset', () => {
     expect(io.stdout.join('\n')).toContain(
       'explicit chaos flags  >  --preset  >  config file  >  built-in defaults',
     );
+  });
+});
+
+/** Writes a config file that is removed after the test that made it. */
+function writeTempConfig(contents: string): string {
+  const dir = mkdtempSync(join(tmpdir(), 'chaos-proxy-program-'));
+  tempDirs.push(dir);
+  const path = join(dir, 'chaos.yml');
+  writeFileSync(path, contents, 'utf8');
+
+  return path;
+}
+
+describe('runCli --print-config', () => {
+  it('prints the resolved configuration and succeeds', async () => {
+    const io = captureIo();
+
+    await expect(runCli(['--target', 'http://localhost:3000', '--print-config'], io)).resolves.toBe(
+      0,
+    );
+
+    expect(io.stderr).toEqual([]);
+    expect(parseYaml(io.stdout.join('\n'))).toMatchObject({
+      target: 'http://localhost:3000',
+      port: 4000,
+      config: null,
+      preset: null,
+      seed: null,
+    });
+  });
+
+  // Nothing is bound, so the port a run would have taken is still free
+  // afterwards — the surest evidence available in-process that no listener was
+  // opened, since a listening proxy would have taken it.
+  it('never starts a server, so the port it names is still free', async () => {
+    const port = await occupyPort();
+    const io = captureIo();
+
+    // A port that is already in use fails an ordinary run outright; printing
+    // the configuration does not care, because it never tries to bind.
+    await expect(
+      runCli(['--target', 'http://localhost:3000', '--port', String(port), '--print-config'], io),
+    ).resolves.toBe(0);
+
+    expect(io.stderr).toEqual([]);
+    expect(parseYaml(io.stdout.join('\n'))).toMatchObject({ port });
+  });
+
+  // Explicitly requested output is not "informational": --quiet silences what
+  // the CLI volunteers, not what it was asked for by name.
+  it('is not suppressed by --quiet', async () => {
+    const quiet = captureIo();
+    const loud = captureIo();
+
+    await expect(
+      runCli(['--target', 'http://localhost:3000', '--quiet', '--print-config'], quiet),
+    ).resolves.toBe(0);
+    await expect(
+      runCli(['--target', 'http://localhost:3000', '--print-config'], loud),
+    ).resolves.toBe(0);
+
+    expect(quiet.stdout).toEqual(loud.stdout);
+    expect(quiet.stdout.join('\n')).toContain('target: http://localhost:3000');
+  });
+
+  it('prints the configuration on its own, with no startup summary around it', async () => {
+    const io = captureIo();
+
+    await expect(
+      runCli(['--target', 'http://localhost:3000', '--preset', 'flaky-api', '--print-config'], io),
+    ).resolves.toBe(0);
+
+    const text = io.stdout.join('\n');
+
+    expect(text).not.toContain('listening on');
+    expect(text).not.toContain('Chaos Proxy configuration');
+    expect(text.split('\n')[0]).toBe('target: http://localhost:3000');
+  });
+
+  it('shows the effective chaos rather than what asked for it', async () => {
+    const path = writeTempConfig(`target: http://localhost:3000
+
+defaults:
+  errorRate: 0.1
+
+rules:
+  - match: /api/payments/*
+    errorRate: 1
+    timeoutRate: 0.2
+`);
+    const io = captureIo();
+
+    await expect(
+      runCli(
+        ['--config', path, '--preset', 'flaky-api', '--error-rate', '0.5', '--print-config'],
+        io,
+      ),
+    ).resolves.toBe(0);
+
+    expect(parseYaml(io.stdout.join('\n'))).toMatchObject({
+      config: path,
+      preset: 'flaky-api',
+      defaults: { errorRate: 0.5, errorStatus: 503 },
+      rules: [{ match: '/api/payments/*', errorRate: 0.5, errorStatus: 503, timeoutRate: 0.2 }],
+    });
+  });
+
+  // The same missing-target complaint an ordinary run gets: a configuration
+  // that could not be started is not printed as though it could.
+  it('still requires a target, and says so on stderr', async () => {
+    const io = captureIo();
+
+    await expect(runCli(['--print-config', '--latency', '500'], io)).resolves.toBe(1);
+
+    expect(io.stdout).toEqual([]);
+    expect(io.stderr.join('\n')).toContain('--target');
+  });
+
+  it('reports an unusable config file on stderr and prints nothing', async () => {
+    const path = writeTempConfig('target: http://localhost:3000\nfoo: 1\n');
+    const io = captureIo();
+
+    await expect(runCli(['--config', path, '--print-config'], io)).resolves.toBe(1);
+
+    expect(io.stdout).toEqual([]);
+    expect(io.stderr.join('\n')).toContain(`Invalid config in ${path}`);
+  });
+
+  it('reports a chaos value the proxy core rejects, without printing one', async () => {
+    const io = captureIo();
+
+    await expect(
+      runCli(['--target', 'http://localhost:3000', '--error-rate', '5', '--print-config'], io),
+    ).resolves.toBe(1);
+
+    expect(io.stdout).toEqual([]);
+    expect(io.stderr[0]).toContain('--error-rate');
+  });
+
+  it.each([['--help'], ['--version']])('leaves %s alone', async (flag) => {
+    const io = captureIo();
+
+    await expect(runCli([flag, '--print-config'], io)).resolves.toBe(0);
+
+    expect(io.stdout.join('\n')).not.toContain('target:');
+  });
+
+  it('offers the option in the help, alongside the config file it settles', async () => {
+    const io = captureIo();
+
+    await runCli(['--help'], io);
+
+    const help = io.stdout.join('\n');
+
+    expect(help).toContain('--print-config');
+    expect(help).toContain('./chaos.yml');
   });
 });

@@ -26,6 +26,7 @@ describe('parseCliArgs', () => {
       chaos: {},
       seed: undefined,
       quiet: false,
+      printConfig: false,
     });
   });
 
@@ -36,6 +37,21 @@ describe('parseCliArgs', () => {
   it('reports --quiet only when it was given', () => {
     expect(parseRun(['--target', TARGET]).quiet).toBe(false);
     expect(parseRun(['--target', TARGET, '--quiet']).quiet).toBe(true);
+  });
+
+  it('reports --print-config only when it was given', () => {
+    expect(parseRun(['--target', TARGET]).printConfig).toBe(false);
+    expect(parseRun(['--target', TARGET, '--print-config']).printConfig).toBe(true);
+  });
+
+  it('does not offer a short alias for --print-config', () => {
+    expect(() => parseCliArgs(['--target', TARGET, '-p'])).toThrow(CliError);
+  });
+
+  // Help and version are answered before anything else is looked at, so the
+  // combination is unambiguous rather than something to guess at.
+  it.each([['--help'], ['--version']])('prefers %s over --print-config', (flag) => {
+    expect(parseCliArgs([flag, '--print-config']).kind).toBe(flag.slice(2));
   });
 
   it('reports the path given to --config', () => {
@@ -117,11 +133,18 @@ describe('parseCliArgs', () => {
     expect(parseCliArgs(['--version', '--help'])).toEqual({ kind: 'help' });
   });
 
-  it.each([[[]], [['--latency', '500']], [['--target=']]])(
-    'rejects %j because no target was given',
+  // An empty `--target` is a value the user typed and got wrong, so it is
+  // rejected here. A missing one is not: `./chaos.yml` may still supply it, and
+  // only the resolver knows whether that file exists.
+  it('rejects an empty --target', () => {
+    expect(() => parseCliArgs(['--target='])).toThrow(CliError);
+    expect(() => parseCliArgs(['--target='])).toThrow(/--target/);
+  });
+
+  it.each([[[]], [['--latency', '500']]])(
+    'leaves %j with no target for the resolver to settle',
     (argv) => {
-      expect(() => parseCliArgs(argv)).toThrow(CliError);
-      expect(() => parseCliArgs(argv)).toThrow(/--target/);
+      expect(() => parseCliArgs(argv)).not.toThrow();
     },
   );
 

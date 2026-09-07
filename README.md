@@ -5,9 +5,10 @@ A local developer tool for testing how an application behaves when its API misbe
 > **Status: under development.** Chaos Proxy runs from the command line and can forward HTTP
 > traffic to a target API, inject a fixed artificial latency, inject synthetic HTTP errors, inject
 > synthetic timeouts, and abruptly reset client connections — globally, or per endpoint through a
-> YAML config file — printing one line per request as it goes. Named presets cover the common
-> scenarios, and `--seed` makes a run reproducible. Refusing connections outright and mid-stream
-> failures do not exist yet.
+> YAML config file — printing one line per request as it goes. A `chaos.yml` in the working
+> directory is picked up automatically, and `--print-config` shows the configuration a run would
+> use without starting anything. Named presets cover the common scenarios, and `--seed` makes a run
+> reproducible. Refusing connections outright and mid-stream failures do not exist yet.
 
 Chaos Proxy sits between an application and an API and deliberately degrades that connection, so
 that loading states, retries, error handling, and timeout behaviour can be exercised locally.
@@ -83,24 +84,26 @@ never reachable from the rest of the network. That is deliberate and not configu
 
 ### Options
 
-| Option                     | Default    | Description                                                     |
-| -------------------------- | ---------- | --------------------------------------------------------------- |
-| `--target <url>`           | _required_ | API to forward to. Must be an absolute `http:` or `https:` URL. |
-| `--config <path>`          |            | YAML config file with defaults and endpoint rules.              |
-| `--preset <name>`          |            | Use a built-in chaos preset. See [Presets](#presets).           |
-| `--port <1-65535>`         | `4000`     | Port to listen on, on `127.0.0.1`.                              |
-| `--latency <ms>`           | `0`        | Fixed delay added to every request.                             |
-| `--error-rate <0-1>`       | `0`        | Fraction of requests answered with a synthetic error.           |
-| `--error-status <400-599>` | `500`      | Status code used by injected errors.                            |
-| `--timeout-rate <0-1>`     | `0`        | Fraction of requests held open and then timed out.              |
-| `--timeout <ms>`           | `30000`    | How long a timed-out request is held before it gets a `504`.    |
-| `--reset-rate <0-1>`       | `0`        | Fraction of requests whose client connection is abruptly reset. |
-| `--seed <value>`           |            | Make chaos decisions deterministic, for reproducible runs.      |
-| `--quiet`                  |            | Print nothing but errors.                                       |
-| `-h`, `--help`             |            | Print usage and exit.                                           |
-| `-v`, `--version`          |            | Print the package version and exit.                             |
+| Option                     | Default       | Description                                                     |
+| -------------------------- | ------------- | --------------------------------------------------------------- |
+| `--target <url>`           | _required_    | API to forward to. Must be an absolute `http:` or `https:` URL. |
+| `--config <path>`          | `./chaos.yml` | YAML config file with defaults and endpoint rules.              |
+| `--preset <name>`          |               | Use a built-in chaos preset. See [Presets](#presets).           |
+| `--port <1-65535>`         | `4000`        | Port to listen on, on `127.0.0.1`.                              |
+| `--latency <ms>`           | `0`           | Fixed delay added to every request.                             |
+| `--error-rate <0-1>`       | `0`           | Fraction of requests answered with a synthetic error.           |
+| `--error-status <400-599>` | `500`         | Status code used by injected errors.                            |
+| `--timeout-rate <0-1>`     | `0`           | Fraction of requests held open and then timed out.              |
+| `--timeout <ms>`           | `30000`       | How long a timed-out request is held before it gets a `504`.    |
+| `--reset-rate <0-1>`       | `0`           | Fraction of requests whose client connection is abruptly reset. |
+| `--seed <value>`           |               | Make chaos decisions deterministic, for reproducible runs.      |
+| `--quiet`                  |               | Print nothing but errors.                                       |
+| `--print-config`           |               | Print the resolved configuration and exit.                      |
+| `-h`, `--help`             |               | Print usage and exit.                                           |
+| `-v`, `--version`          |               | Print the package version and exit.                             |
 
-`--target` is required unless the config file supplies it.
+`--target` is required unless the config file supplies it. `--config` defaults to `./chaos.yml`
+when that file exists — see [Conventional config file](#conventional-config-file).
 
 Invalid values are rejected before the server starts, with a message naming the option — they are
 never silently clamped. A port that is already in use is reported as such rather than as a stack
@@ -135,7 +138,9 @@ or a cookie into a terminal. A request whose client disconnects before the respo
 prints nothing rather than a status it never received.
 
 `--quiet` turns off informational output — the startup summary, these lines, and the shutdown
-notice. Errors still go to stderr, and `--help` and `--version` still print.
+notice. Errors still go to stderr, and `--help`, `--version` and
+[`--print-config`](#inspecting-the-configuration) still print: it silences what Chaos Proxy
+volunteers, not what it was asked for by name.
 
 ```bash
 chaos-proxy --target http://localhost:3000 --quiet
@@ -555,10 +560,114 @@ Latency: 100ms
 Every request is now delayed by 100 ms, anything under `/api/payments/` fails with `503` instead
 of being forwarded, and half the requests under `/api/upload/` lose their connection. The startup
 summary describes what applies to a request no rule matches, so per-rule rates are left in the
-file rather than reprinted. A relative path is resolved against the directory you run the command
-from. There is no auto-discovery: a config file is used only when `--config` names it.
+file rather than reprinted. `Config:` names the file in effect by absolute path, so which one that
+is never has to be guessed at.
+
+A relative path is resolved against the directory you run the command from.
 
 [`examples/chaos.yml`](examples/chaos.yml) is a complete file to copy.
+
+### Conventional config file
+
+If the directory you run from contains a file called `chaos.yml`, Chaos Proxy loads it
+automatically, so a project with one checked in needs no flag at all:
+
+```bash
+chaos-proxy
+```
+
+That is the whole of the discovery rule. Parent directories are not searched, and neither are your
+home directory, `~/.config`, `package.json`, `chaos.yaml` or `.chaos.yml` — exactly one name, in
+exactly one place, so the answer to "which file is this run using" is never a guess. Its absence is
+not an error: without one, a run works as it always has.
+
+`--config` always wins:
+
+```bash
+chaos-proxy --config staging.yml   # used even if ./chaos.yml exists
+```
+
+And it wins even when it is wrong. A `--config` naming a file that is not there fails, rather than
+quietly falling back to `./chaos.yml` and running a configuration you did not ask for:
+
+```text
+chaos-proxy: Config file not found: /home/you/project/staging.yml
+```
+
+### Inspecting the configuration
+
+Between a config file, a preset and whatever flags are on the command line, what a run will
+actually do can take some working out. `--print-config` settles all of it and prints the answer,
+without starting anything:
+
+```bash
+chaos-proxy \
+  --preset flaky-api \
+  --error-rate 0.5 \
+  --print-config
+```
+
+```yaml
+target: http://localhost:3000
+port: 4000
+config: /home/you/project/chaos.yml
+preset: flaky-api
+seed: null
+defaults:
+  latencyMs: 100
+  errorRate: 0.5
+  errorStatus: 503
+  timeoutRate: 0
+  timeoutMs: 30000
+  resetRate: 0
+rules:
+  - match: /api/payments/*
+    latencyMs: 100
+    errorRate: 0.5
+    errorStatus: 503
+    timeoutRate: 0
+    timeoutMs: 30000
+    resetRate: 0
+```
+
+No listener is opened, no upstream is contacted, and it exits `0`. The YAML goes to stdout on its
+own — no heading, no summary — so it can be piped somewhere. Configuration errors go to stderr and
+exit non-zero, exactly as they would have on a real run.
+
+What is printed is the **effective** configuration, not an echo of the file. The rule above sets
+`errorRate: 1` in `chaos.yml`; the preset would make it `0.25`; the flag settles it at `0.5`, and
+that is what the rule is shown as. `timeoutRate`, which neither the preset nor the flag mentions,
+keeps whatever the file gave it. Every value is filled in, including the ones nothing configured,
+so `resetRate: 0` says resets are off rather than leaving you to wonder.
+
+`config`, `preset` and `seed` are `null` when there are none. `config` is the absolute path of the
+file in use, which is the quickest way to confirm what auto-discovery picked up.
+
+It prints configuration and nothing else: no environment variables, no headers, no request or
+response data. The seed appears because it is a value you chose.
+
+`--quiet` does not suppress it — it was asked for by name.
+
+### From nothing to a running proxy
+
+```bash
+cat > chaos.yml <<'YAML'
+target: http://localhost:3000
+
+defaults:
+  latencyMs: 250
+
+rules:
+  - match: /api/payments/*
+    errorRate: 0.5
+    errorStatus: 503
+YAML
+
+chaos-proxy --print-config   # check what that means
+chaos-proxy                  # run it
+```
+
+Neither command needs `--config`: the file is right there.
 
 ### Schema
 
@@ -575,8 +684,22 @@ from. There is no auto-discovery: a config file is used only when `--config` nam
 reported as one rather than being ignored:
 
 ```text
-chaos-proxy: Invalid config: unknown field "errorate" in rules[0].
+chaos-proxy: Invalid config in /home/you/project/chaos.yml: rules[0] contains unknown field
+"errorate". Known fields: match, latencyMs, errorRate, errorStatus, timeoutRate, timeoutMs,
+resetRate.
 ```
+
+Every message says which file it is about and where in that file the problem is, before it says
+what the problem is:
+
+```text
+chaos-proxy: Invalid config in /home/you/project/chaos.yml: defaults.errorRate 5: expected a number between 0 and 1 inclusive.
+chaos-proxy: Invalid config in /home/you/project/chaos.yml: rules[2].match "api/*" must start with "/".
+chaos-proxy: Could not parse /home/you/project/chaos.yml as YAML: Nested mappings are not allowed in compact mappings at line 8, column 5.
+```
+
+Naming the file matters more than it once did, since the one in effect may be a `chaos.yml` that
+was picked up rather than typed.
 
 ### Matching
 
@@ -630,8 +753,13 @@ everywhere — including inside a rule that sets `errorRate: 1`. The reasoning i
 on the spot is the more deliberate of the two. A [preset](#presets) sits between the two, above
 everything the file says and below anything typed.
 
-Configuration is `--config` only. Environment variables, `.chaosrc`-style auto-discovery, JSON
-config, hot reload, and config includes are not supported.
+Use [`--print-config`](#inspecting-the-configuration) to see how a particular combination of all
+four settles, without starting the proxy.
+
+Configuration comes from `--config`, or from a `./chaos.yml` in the working directory, and nowhere
+else. Environment variables and `${VAR}` interpolation, other file names, parent-directory or
+home-directory lookup, JSON and TOML config, remote config, multiple files, includes, inheritance,
+hot reload, and commands that write or migrate a config file are all unsupported.
 
 ## Development
 
@@ -668,7 +796,8 @@ npm run dev -- --target http://localhost:3000 --latency 500
 | Error injection     | Fixed status, fixed probability      |
 | Timeout injection   | Fixed duration, fixed probability    |
 | Connection resets   | Fixed probability, before forwarding |
-| Config files        | YAML, with endpoint rules            |
+| Config files        | YAML, `./chaos.yml` auto-discovered  |
+| Config inspection   | `--print-config`, effective values   |
 | Presets             | Four built-in scenarios              |
 | Request logging     | One line per completed request       |
 | Reproducibility     | `--seed`, per request sequence       |
