@@ -7,11 +7,11 @@ import type {
   ServerResponse,
 } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { createProxyServer } from '../../src/index.js';
 import type { ProxyServerOptions } from '../../src/index.js';
-import { shouldInjectError } from '../../src/proxy/server.js';
+import { shouldInjectError, shouldInjectTimeout } from '../../src/proxy/server.js';
 
 /** A request as it arrived at the temporary upstream server. */
 interface RecordedRequest {
@@ -38,6 +38,7 @@ afterEach(async () => {
   const servers = [...startedServers];
   startedServers.clear();
   await Promise.all(servers.map(stop));
+  vi.restoreAllMocks();
 });
 
 function addressOf(server: Server): AddressInfo {
@@ -218,6 +219,34 @@ describe('createProxyServer', () => {
 
   it.each([400, 429, 500, 503, 599])('accepts an errorStatus of %p', (errorStatus) => {
     expect(() => createProxyServer({ target: 'http://localhost:5000', errorStatus })).not.toThrow();
+  });
+
+  it.each([-0.1, 1.1, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY])(
+    'rejects a timeoutRate of %p',
+    (timeoutRate) => {
+      expect(() => createProxyServer({ target: 'http://localhost:5000', timeoutRate })).toThrow(
+        RangeError,
+      );
+    },
+  );
+
+  it.each([0, 0.25, 1])('accepts a timeoutRate of %p', (timeoutRate) => {
+    expect(() => createProxyServer({ target: 'http://localhost:5000', timeoutRate })).not.toThrow();
+  });
+
+  it.each([-1, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY])(
+    'rejects a timeoutMs of %p',
+    (timeoutMs) => {
+      expect(() => createProxyServer({ target: 'http://localhost:5000', timeoutMs })).toThrow(
+        RangeError,
+      );
+    },
+  );
+
+  // `0` is accepted deliberately: it answers on the next timer tick, which is a
+  // useful deterministic edge case rather than a useful amount of chaos.
+  it.each([0, 100, 30_000])('accepts a timeoutMs of %p', (timeoutMs) => {
+    expect(() => createProxyServer({ target: 'http://localhost:5000', timeoutMs })).not.toThrow();
   });
 });
 
@@ -589,5 +618,224 @@ describe('error injection', () => {
     // Writing to the gone client did not take the proxy down.
     const response = await fetch(`${proxyUrl}/api/users`);
     expect(response.status).toBe(500);
+  });
+});
+
+describe('shouldInjectTimeout', () => {
+  it.each([
+    [0.25, true],
+    [0.75, false],
+  ])('injects for a random value of %p at a timeoutRate of 0.5: %p', (value, expected) => {
+    expect(shouldInjectTimeout(0.5, () => value)).toBe(expected);
+  });
+
+  it('never injects at a timeoutRate of 0', () => {
+    expect(shouldInjectTimeout(0, () => 0)).toBe(false);
+  });
+
+  it('always injects at a timeoutRate of 1', () => {
+    // The largest value Math.random() can return is just below 1.
+    expect(shouldInjectTimeout(1, () => 0.999999999999999)).toBe(true);
+  });
+
+  it('is drawn before the error rate, which only sees the requests it declines', () => {
+    // Mirrors the order the request handler applies the two predicates in, with
+    // scripted draws standing in for Math.random(). The rates are sequential,
+    // not independent: at timeoutRate 0.5 and errorRate 1, the half that is not
+    // timed out is what the error rate is applied to.
+    const draws = [0.25, 0.75, 0.5];
+    const next = (): number => draws.shift() ?? 0;
+
+    // First request: timed out, so the error rate is never consulted.
+    expect(shouldInjectTimeout(0.5, next)).toBe(true);
+
+    // Second request: not timed out, so it falls through to the error rate.
+    expect(shouldInjectTimeout(0.5, next)).toBe(false);
+    expect(shouldInjectError(1, next)).toBe(true);
+  });
+});
+
+describe('timeout injection', () => {
+  it('forwards every request when timeoutRate is 0', async () => {
+    const upstream = await startUpstream((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/plain' });
+      res.end('ok');
+    });
+    const proxyUrl = await startProxy(upstream.origin, { timeoutRate: 0, timeoutMs: 100 });
+
+    const response = await fetch(`${proxyUrl}/api/users`);
+
+    expect(response.status).toBe(200);
+    await expect(response.text()).resolves.toBe('ok');
+    expect(upstream.requests).toHaveLength(1);
+  });
+
+  it('holds the request and answers 504 without reaching the upstream when timeoutRate is 1', async () => {
+    const upstream = await startUpstream((_req, res) => {
+      res.writeHead(200);
+      res.end('should not be reached');
+    });
+    const proxyUrl = await startProxy(upstream.origin, { timeoutRate: 1, timeoutMs: 100 });
+
+    const startedAt = performance.now();
+    const response = await fetch(`${proxyUrl}/api/users?page=2`);
+    const elapsed = performance.now() - startedAt;
+
+    expect(response.status).toBe(504);
+    expect(response.headers.get('content-type')).toBe('text/plain; charset=utf-8');
+    await expect(response.text()).resolves.toBe('Chaos Proxy injected timeout');
+    // Lower bound only, with slack for timer coarseness and loaded CI runners:
+    // the point is that the response was held, not that it took exactly 100 ms.
+    expect(elapsed).toBeGreaterThanOrEqual(75);
+    expect(upstream.requests).toHaveLength(0);
+    expect(upstream.connectionCount()).toBe(0);
+  });
+
+  it('answers on the next tick when timeoutMs is 0', async () => {
+    const upstream = await startUpstream((_req, res) => {
+      res.writeHead(200);
+      res.end('should not be reached');
+    });
+    const proxyUrl = await startProxy(upstream.origin, { timeoutRate: 1, timeoutMs: 0 });
+
+    const response = await fetch(`${proxyUrl}/api/users`);
+
+    expect(response.status).toBe(504);
+    await expect(response.text()).resolves.toBe('Chaos Proxy injected timeout');
+    expect(upstream.connectionCount()).toBe(0);
+  });
+
+  it('times a request with a body out without forwarding or hanging', async () => {
+    const upstream = await startUpstream((_req, res) => {
+      res.writeHead(200);
+      res.end('should not be reached');
+    });
+    const proxyUrl = await startProxy(upstream.origin, { timeoutRate: 1, timeoutMs: 50 });
+
+    const response = await fetch(`${proxyUrl}/api/users`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'ada' }),
+    });
+
+    expect(response.status).toBe(504);
+    await expect(response.text()).resolves.toBe('Chaos Proxy injected timeout');
+    expect(upstream.requests).toHaveLength(0);
+    expect(upstream.connectionCount()).toBe(0);
+
+    // The proxy is still serving, so the never-read body did not wedge it.
+    const next = await fetch(`${proxyUrl}/api/users`);
+    expect(next.status).toBe(504);
+  });
+
+  it('waits for the latency and then the timeout, in that order', async () => {
+    const upstream = await startUpstream((_req, res) => {
+      res.writeHead(200);
+      res.end('should not be reached');
+    });
+    const proxyUrl = await startProxy(upstream.origin, {
+      latencyMs: 100,
+      timeoutRate: 1,
+      timeoutMs: 100,
+    });
+
+    const startedAt = performance.now();
+    const response = await fetch(`${proxyUrl}/api/users`);
+    const elapsed = performance.now() - startedAt;
+
+    expect(response.status).toBe(504);
+    await expect(response.text()).resolves.toBe('Chaos Proxy injected timeout');
+    // Both stages are paid: a lower bound comfortably above either one alone,
+    // with slack instead of an exact 200 ms.
+    expect(elapsed).toBeGreaterThanOrEqual(150);
+    expect(upstream.connectionCount()).toBe(0);
+  });
+
+  it('answers 504 rather than the synthetic error when both are certain', async () => {
+    const upstream = await startUpstream((_req, res) => {
+      res.writeHead(200);
+      res.end('should not be reached');
+    });
+    const proxyUrl = await startProxy(upstream.origin, {
+      timeoutRate: 1,
+      timeoutMs: 50,
+      errorRate: 1,
+      errorStatus: 503,
+    });
+
+    const response = await fetch(`${proxyUrl}/api/users`);
+
+    // The timeout is drawn first, so the error rate never gets to decide.
+    expect(response.status).toBe(504);
+    await expect(response.text()).resolves.toBe('Chaos Proxy injected timeout');
+    expect(upstream.connectionCount()).toBe(0);
+  });
+
+  it('falls through to the synthetic error when the timeout is not selected', async () => {
+    const upstream = await startUpstream((_req, res) => {
+      res.writeHead(200);
+      res.end('should not be reached');
+    });
+    const proxyUrl = await startProxy(upstream.origin, {
+      timeoutRate: 0,
+      timeoutMs: 50,
+      errorRate: 1,
+    });
+
+    const response = await fetch(`${proxyUrl}/api/users`);
+
+    expect(response.status).toBe(500);
+    await expect(response.text()).resolves.toBe('Chaos Proxy injected error');
+    expect(upstream.connectionCount()).toBe(0);
+  });
+
+  it('cancels the timeout when the client disconnects while it is pending', async () => {
+    // A distinctive duration, so the pending timer can be picked out of any
+    // other timer the runtime happens to schedule during the test.
+    const timeoutMs = 137;
+    const upstream = await startUpstream((_req, res) => {
+      res.writeHead(200);
+      res.end('should not be reached');
+    });
+    const scheduled = vi.spyOn(globalThis, 'setTimeout');
+    const cleared = vi.spyOn(globalThis, 'clearTimeout');
+    const proxy = createProxyServer({ target: upstream.origin, timeoutRate: 1, timeoutMs });
+    // The proxy's own handler is registered first, so by the time this resolves
+    // the timeout timer has already been started for this request.
+    const waitStarted = new Promise<void>((resolve) => {
+      proxy.once('request', () => {
+        resolve();
+      });
+    });
+    const { port } = await start(proxy);
+    const proxyUrl = `http://127.0.0.1:${port}`;
+
+    let responded = false;
+    const req = httpRequest(`${proxyUrl}/api/users`, () => {
+      responded = true;
+    });
+    req.on('error', () => {
+      // Expected: the client aborts itself below.
+    });
+    req.end();
+
+    await waitStarted;
+    const index = scheduled.mock.calls.findIndex(([, delay]) => delay === timeoutMs);
+    expect(index).toBeGreaterThanOrEqual(0);
+    const pendingTimer: unknown = scheduled.mock.results[index]?.value;
+
+    req.destroy();
+    await sleep(timeoutMs * 2);
+
+    // The pending timer was cleared rather than left to fire at a gone client,
+    // nothing was written back, and no upstream connection was ever opened.
+    expect(cleared).toHaveBeenCalledWith(pendingTimer);
+    expect(responded).toBe(false);
+    expect(upstream.connectionCount()).toBe(0);
+
+    // The proxy is still healthy: a later request is still timed out normally.
+    const response = await fetch(`${proxyUrl}/api/users`);
+    expect(response.status).toBe(504);
+    await expect(response.text()).resolves.toBe('Chaos Proxy injected timeout');
   });
 });

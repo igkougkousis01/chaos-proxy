@@ -2,9 +2,10 @@
  * Public entry point for the Chaos Proxy package.
  *
  * The proxy core can forward HTTP traffic to a target API, inject a fixed
- * artificial latency, and answer a share of requests with a synthetic HTTP
- * error. Remaining chaos behaviour (timeouts, connection failures) and CLI
- * configuration are added in later features.
+ * artificial latency, answer a share of requests with a synthetic HTTP error,
+ * and hold a share of requests open until they hit a synthetic timeout.
+ * Remaining chaos behaviour (connection failures) and CLI configuration are
+ * added in later features.
  */
 
 export { createProxyServer } from './proxy/server.js';

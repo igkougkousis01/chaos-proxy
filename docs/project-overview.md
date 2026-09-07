@@ -17,7 +17,8 @@ Chaos Proxy should eventually support:
   implemented)_
 - **HTTP error injection** — return chosen status codes (500, 503, 429, …) instead of real
   responses. _(a single fixed status, at a fixed probability, implemented)_
-- **Request timeouts** — hold a request open so the client hits its own timeout.
+- **Request timeouts** — hold a request open so the client hits its own timeout. _(a fixed
+  hold, at a fixed probability, implemented)_
 - **Connection failures** — refuse, drop, or reset connections.
 - **Endpoint-specific rules** — apply different chaos behaviour per path, method, or pattern.
 - **Request logging** — show what was forwarded, what was degraded, and why.
@@ -82,11 +83,18 @@ The chaos behaviour implemented so far also lives there, and is programmatic onl
   streaming untouched.
 - `errorRate` and `errorStatus` answer that fraction of requests with a synthetic HTTP error
   (default `500`, plain text) instead of forwarding them, without opening an upstream connection.
-  The decision is made per request, after the latency delay, so an injected failure can arrive
-  slowly.
+- `timeoutRate` and `timeoutMs` hold that fraction of requests open for a fixed duration (default
+  `30000` ms) and then answer `504 Gateway Timeout` with a plain-text body, again without opening
+  an upstream connection or forwarding the request body. This is an injected stall, not detection
+  of a genuinely slow upstream.
 
-Randomised delays, choosing between multiple or weighted error statuses, per-endpoint or
-per-method rules, timeouts, connection failures, configuration loading, and CLI argument parsing
-do not exist yet.
+Chaos is applied in a fixed order — latency delay, then timeout, then error, then forwarding —
+and each request receives at most one injected outcome. The two rates are evaluated sequentially:
+`errorRate` only sees the requests that `timeoutRate` did not select. If the client disconnects
+during either wait, the pending timer is cancelled and nothing is decided, forwarded, or written.
+
+Randomised or ranged delays and timeout durations, choosing between multiple or weighted error
+statuses, per-endpoint or per-method rules, connection failures, configuration loading, and CLI
+argument parsing do not exist yet.
 
 It is built on `node:http` and `node:https` with no runtime dependencies.
