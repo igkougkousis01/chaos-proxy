@@ -40,6 +40,26 @@ export interface ProxyServerOptions {
    * status in the `400`-`599` range. Defaults to `500`.
    */
   readonly errorStatus?: number;
+
+  /**
+   * Probability, from `0` to `1`, that a request is held open and then answered
+   * with a synthetic timeout instead of being forwarded upstream. Omitted or
+   * `0` means never.
+   *
+   * The decision is made per request, after any {@link latencyMs} delay and
+   * before {@link errorRate}, so a request selected for a timeout is never also
+   * given a synthetic HTTP error.
+   */
+  readonly timeoutRate?: number;
+
+  /**
+   * How long, in milliseconds, an injected timeout holds the request open
+   * before the proxy answers `504 Gateway Timeout`. Defaults to `30000`.
+   *
+   * `0` is allowed and means the `504` is sent on the next timer tick, without
+   * waiting: a deterministic edge case rather than a useful amount of chaos.
+   */
+  readonly timeoutMs?: number;
 }
 
 /**
@@ -68,6 +88,15 @@ const DEFAULT_ERROR_STATUS = 500;
 /** Body of an injected error response, so it is recognisable in a client. */
 const INJECTED_ERROR_BODY = 'Chaos Proxy injected error';
 
+/** Status returned by an injected timeout once its wait has elapsed. */
+const INJECTED_TIMEOUT_STATUS = 504;
+
+/** Body of an injected timeout response, so it is recognisable in a client. */
+const INJECTED_TIMEOUT_BODY = 'Chaos Proxy injected timeout';
+
+/** Wait before an injected timeout answers when `timeoutMs` is omitted. */
+const DEFAULT_TIMEOUT_MS = 30_000;
+
 /**
  * Parses and validates the configured target.
  *
@@ -94,44 +123,44 @@ function parseTarget(target: string): URL {
 }
 
 /**
- * Validates the configured latency and normalises "no latency" to `0`.
+ * Validates one of the configured durations and applies its default.
  *
- * @throws {RangeError} If the latency is negative, `NaN`, or infinite.
+ * @throws {RangeError} If the duration is negative, `NaN`, or infinite.
  */
-function parseLatencyMs(latencyMs: number | undefined): number {
-  if (latencyMs === undefined) {
-    return 0;
+function parseDurationMs(value: number | undefined, name: string, fallback: number): number {
+  if (value === undefined) {
+    return fallback;
   }
 
-  if (!Number.isFinite(latencyMs) || latencyMs < 0) {
+  if (!Number.isFinite(value) || value < 0) {
     throw new RangeError(
-      `Invalid latencyMs ${String(latencyMs)}: expected a finite number of milliseconds >= 0.`,
+      `Invalid ${name} ${String(value)}: expected a finite number of milliseconds >= 0.`,
     );
   }
 
-  return latencyMs;
+  return value;
 }
 
 /**
- * Validates the configured error rate and normalises "never" to `0`.
+ * Validates one of the configured chaos rates and normalises "never" to `0`.
  *
  * Invalid values are rejected rather than clamped, so a typo cannot silently
  * turn into a different amount of chaos.
  *
  * @throws {RangeError} If the rate is outside `0`-`1`, `NaN`, or infinite.
  */
-function parseErrorRate(errorRate: number | undefined): number {
-  if (errorRate === undefined) {
+function parseRate(value: number | undefined, name: string): number {
+  if (value === undefined) {
     return 0;
   }
 
-  if (!Number.isFinite(errorRate) || errorRate < 0 || errorRate > 1) {
+  if (!Number.isFinite(value) || value < 0 || value > 1) {
     throw new RangeError(
-      `Invalid errorRate ${String(errorRate)}: expected a number between 0 and 1 inclusive.`,
+      `Invalid ${name} ${String(value)}: expected a number between 0 and 1 inclusive.`,
     );
   }
 
-  return errorRate;
+  return value;
 }
 
 /**
@@ -157,13 +186,32 @@ function parseErrorStatus(errorStatus: number | undefined): number {
 }
 
 /**
- * Decides whether one request should receive a synthetic error.
+ * Decides whether one request should be held open and then answered with a
+ * synthetic timeout.
  *
- * This is the only randomness in the proxy. Keeping it in a single pure
- * function keeps `Math.random()` out of the forwarding path and makes partial
- * rates testable without statistical assertions. `Math.random()` returns a
- * value in `[0, 1)`, so a rate of `0` never injects and a rate of `1` always
- * does.
+ * This and {@link shouldInjectError} are the only randomness in the proxy, one
+ * draw each. Keeping them in pure functions keeps `Math.random()` out of the
+ * forwarding path and makes partial rates testable without statistical
+ * assertions. `Math.random()` returns a value in `[0, 1)`, so a rate of `0`
+ * never injects and a rate of `1` always does.
+ *
+ * The two draws are sequential rather than independent overall probabilities:
+ * this one is taken first, and {@link shouldInjectError} is consulted only when
+ * it declines. `timeoutRate: 0.2` with `errorRate: 0.5` therefore means 20% of
+ * requests time out and half of the remaining 80% — 40% overall — are failed.
+ *
+ * @internal Not part of the public API; configure via {@link createProxyServer}.
+ */
+export function shouldInjectTimeout(
+  timeoutRate: number,
+  random: () => number = Math.random,
+): boolean {
+  return random() < timeoutRate;
+}
+
+/**
+ * Decides whether one request should receive a synthetic error, once
+ * {@link shouldInjectTimeout} has declined it.
  *
  * @internal Not part of the public API; configure via {@link createProxyServer}.
  */
@@ -280,24 +328,24 @@ function forward(req: IncomingMessage, res: ServerResponse, target: URL): void {
 }
 
 /**
- * Waits `latencyMs` before running `initiate`, so the artificial delay is paid
- * once at request initiation rather than per body chunk.
+ * Runs `run` after `delayMs`, unless the client disconnects first.
  *
- * The incoming request is left unread while waiting, so its body stays in the
- * socket under normal backpressure instead of being buffered here. If the
- * client goes away first, the timer is cleared: nothing is decided, no upstream
- * request is made, and no response is written to the gone client.
+ * Both stages that deliberately hold a request use this: the artificial latency
+ * paid once at request initiation rather than per body chunk, and the wait an
+ * injected timeout spends before answering. The incoming request is left unread
+ * throughout, so its body stays in the socket under normal backpressure instead
+ * of being buffered here.
+ *
+ * If the client goes away first the timer is cleared and nothing runs — no
+ * decision, no upstream request, and no response written to a gone client. On
+ * the normal path the close listener is removed before `run`, so a request that
+ * passes through both stages never accumulates listeners or live timers.
  */
-function initiateAfter(
-  latencyMs: number,
-  req: IncomingMessage,
-  res: ServerResponse,
-  initiate: (req: IncomingMessage, res: ServerResponse) => void,
-): void {
+function runAfter(delayMs: number, res: ServerResponse, run: () => void): void {
   const timer = setTimeout(() => {
     res.off('close', cancel);
-    initiate(req, res);
-  }, latencyMs);
+    run();
+  }, delayMs);
 
   function cancel(): void {
     clearTimeout(timer);
@@ -314,24 +362,36 @@ function initiateAfter(
  * and stop it with `server.close()`.
  *
  * @throws {TypeError} If `target` is not an absolute `http:` or `https:` URL.
- * @throws {RangeError} If `latencyMs` is negative, `NaN`, or infinite.
- * @throws {RangeError} If `errorRate` is outside `0`-`1`, `NaN`, or infinite.
+ * @throws {RangeError} If `latencyMs` or `timeoutMs` is negative, `NaN`, or
+ * infinite.
+ * @throws {RangeError} If `errorRate` or `timeoutRate` is outside `0`-`1`,
+ * `NaN`, or infinite.
  * @throws {RangeError} If `errorStatus` is not an integer from `400` to `599`.
  */
 export function createProxyServer(options: ProxyServerOptions): Server {
   const target = parseTarget(options.target);
-  const latencyMs = parseLatencyMs(options.latencyMs);
-  const errorRate = parseErrorRate(options.errorRate);
+  const latencyMs = parseDurationMs(options.latencyMs, 'latencyMs', 0);
+  const errorRate = parseRate(options.errorRate, 'errorRate');
   const errorStatus = parseErrorStatus(options.errorStatus);
+  const timeoutRate = parseRate(options.timeoutRate, 'timeoutRate');
+  const timeoutMs = parseDurationMs(options.timeoutMs, 'timeoutMs', DEFAULT_TIMEOUT_MS);
 
   /**
-   * Starts one request: either it fails synthetically, or it is forwarded.
+   * Starts one request, choosing exactly one outcome: a synthetic timeout, a
+   * synthetic error, or normal forwarding.
    *
-   * An injected error answers from here, so no upstream connection is opened
-   * and no request body is read; Node discards the unread body as part of
-   * ending the response.
+   * Both injected outcomes answer from here, so no upstream connection is
+   * opened and no request body is read; Node discards the unread body as part
+   * of ending the response.
    */
   function initiate(req: IncomingMessage, res: ServerResponse): void {
+    if (shouldInjectTimeout(timeoutRate)) {
+      runAfter(timeoutMs, res, () => {
+        sendProxyError(res, INJECTED_TIMEOUT_STATUS, INJECTED_TIMEOUT_BODY);
+      });
+      return;
+    }
+
     if (shouldInjectError(errorRate)) {
       sendProxyError(res, errorStatus, INJECTED_ERROR_BODY);
       return;
@@ -346,6 +406,8 @@ export function createProxyServer(options: ProxyServerOptions): Server {
       return;
     }
 
-    initiateAfter(latencyMs, req, res, initiate);
+    runAfter(latencyMs, res, () => {
+      initiate(req, res);
+    });
   });
 }

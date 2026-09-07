@@ -3,9 +3,9 @@
 A local developer tool for testing how an application behaves when its API misbehaves.
 
 > **Status: under development.** The proxy core can forward HTTP traffic to a target API, inject
-> a fixed artificial latency, and inject synthetic HTTP errors. Other chaos behaviour (timeouts,
-> connection failures) does not exist yet, and the CLI currently only prints its name — every
-> option below is programmatic only.
+> a fixed artificial latency, inject synthetic HTTP errors, and inject synthetic timeouts. Other
+> chaos behaviour (connection failures) does not exist yet, and the CLI currently only prints its
+> name — every option below is programmatic only.
 
 ## What it will do
 
@@ -88,6 +88,55 @@ Each request is decided independently. Choosing between several status codes, we
 scoping errors to particular endpoints or methods, and configuring any of this from the CLI or a
 config file are not supported.
 
+## Timeout injection
+
+`timeoutRate` is the probability, from `0` to `1`, that a request is held open and then answered
+with `504 Gateway Timeout` instead of being forwarded. `timeoutMs` is how long it is held, and
+defaults to `30000`. Both are programmatic only — there are no CLI flags for them yet.
+
+```ts
+const server = createProxyServer({
+  target: 'http://localhost:5000',
+  timeoutRate: 0.2, // roughly 1 request in 5 stalls
+  timeoutMs: 3000,
+});
+```
+
+An injected timeout is answered by the proxy itself: no upstream connection is opened and no
+request body is forwarded or buffered. The request simply stays pending for `timeoutMs`, which is
+what lets a client hit its own timeout, and the proxy then sends the plain-text body
+`Chaos Proxy injected timeout` rather than leaving the socket open forever. If the client
+disconnects while the request is being held, the wait is cancelled and nothing is sent.
+
+This is a deliberately stalled request, not detection of a genuinely slow upstream: the proxy
+never contacts the target for a timed-out request.
+
+### Ordering
+
+Chaos is applied in a fixed order, and each request gets **at most one** injected outcome:
+
+```text
+request -> latencyMs delay -> timeout? -> error? -> forward upstream
+```
+
+Any `latencyMs` delay is paid first. Then `timeoutRate` is evaluated; if it selects the request,
+it is held and answered with `504`, and `errorRate` never gets to decide. Only requests that are
+not timed out are offered to `errorRate`, and only requests that neither selects are forwarded.
+So `latencyMs: 100` with `timeoutRate: 1` and `timeoutMs: 3000` makes a request wait roughly
+3.1 seconds and then fail with `504`.
+
+The two rates are therefore sequential rather than independent overall probabilities.
+`timeoutRate: 0.2` with `errorRate: 0.5` means 20% of requests time out, and half of the
+remaining 80% — 40% overall — receive a synthetic error.
+
+Omitting `timeoutRate` (or setting it to `0`) means requests are never timed out. Rates outside
+`0`-`1`, `NaN`, and infinities are rejected with a `RangeError` when the server is created, as
+are negative, `NaN`, and infinite `timeoutMs` values. A `timeoutMs` of `0` is accepted and means
+the `504` is sent on the next timer tick, without waiting.
+
+Random or ranged timeout durations, jitter, dropped or reset TCP connections, per-endpoint
+timeouts, and configuring any of this from the CLI or a config file are not supported.
+
 ## Requirements
 
 - Node.js >= 22.12
@@ -126,6 +175,7 @@ node dist/cli.js
 | HTTP forwarding     | Done         |
 | Latency injection   | Fixed delay  |
 | Error injection     | Programmatic |
+| Timeout injection   | Programmatic |
 | Other chaos         | Not started  |
 
 ## License
