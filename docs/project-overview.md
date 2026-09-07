@@ -19,7 +19,9 @@ Chaos Proxy should eventually support:
   responses. _(a single fixed status, at a fixed probability, implemented)_
 - **Request timeouts** — hold a request open so the client hits its own timeout. _(a fixed
   hold, at a fixed probability, implemented)_
-- **Connection failures** — refuse, drop, or reset connections.
+- **Connection failures** — refuse, drop, or reset connections. _(resetting the client connection
+  before forwarding begins, at a fixed probability, implemented; refusing connections outright and
+  mid-stream resets are not)_
 - **Endpoint-specific rules** — apply different chaos behaviour per path, method, or pattern.
   _(ordered path rules from a YAML config file implemented; method and host rules are not)_
 - **Request logging** — show what was forwarded, what was degraded, and why. _(one line per
@@ -120,7 +122,15 @@ command-line flags  >  --preset  >  config file values  >  built-in defaults
 ```
 
 Chaos flags are applied last of all, so `--error-rate 0` switches error injection off everywhere,
-including inside an endpoint rule that sets it to `1`.
+including inside an endpoint rule that sets it to `1`. `--reset-rate` is an ordinary chaos flag on
+exactly those terms, and `resetRate` is an ordinary config field: unlike `--seed` and `--preset` it
+describes how an API should misbehave rather than how one run should be driven, so it belongs in a
+file that is checked in and shared.
+
+The startup summary reports `Connection resets: <rate>` when the settled global rate is above zero,
+and says nothing when it is not — the same rule the other chaos lines follow. Like them it
+describes what applies to a request no rule matches; per-rule rates stay in the file rather than
+being reprinted as a summary of their own.
 
 `src/presets/index.ts` is the whole of the preset feature: a frozen table of four named blocks of
 chaos options — `slow-api`, `flaky-api`, `timeout-heavy` and `backend-down` — plus the summaries
@@ -171,18 +181,30 @@ from the CLI:
   `30000` ms) and then answer `504 Gateway Timeout` with a plain-text body, again without opening
   an upstream connection or forwarding the request body. This is an injected stall, not detection
   of a genuinely slow upstream.
+- `resetRate` destroys the client connection of that fraction of requests outright. Nothing is
+  written to it — no status line, no headers, no body — so the client sees a transport failure
+  rather than an HTTP response, and no upstream connection is opened either. It is the only
+  outcome that is not an HTTP answer, and the only one with no status code.
 
-Chaos is applied in a fixed order — latency delay, then timeout, then error, then forwarding —
-and each request receives at most one injected outcome. The two rates are evaluated sequentially:
-`errorRate` only sees the requests that `timeoutRate` did not select. If the client disconnects
-during either wait, the pending timer is cancelled and nothing is decided, forwarded, or written.
-Endpoint rules change only which values those steps use; the ordering and the randomness model are
-untouched, and there is no per-rule RNG.
+Chaos is applied in a fixed order — latency delay, then reset, then timeout, then error, then
+forwarding — and each request receives at most one injected outcome. The three rates are evaluated
+sequentially: `timeoutRate` only sees the requests `resetRate` did not select, and `errorRate` only
+sees what neither did. The reset decision comes first because it is the most fundamental of the
+three: once the connection is gone there is nothing left to hold open or to answer, so a request it
+selects contacts no upstream and consumes no further random values. If the client disconnects
+during either wait, the pending timer is cancelled and nothing is decided, forwarded, or written —
+including no reset, since the proxy never got as far as choosing one. Endpoint rules change only
+which values those steps use; the ordering and the randomness model are untouched, and there is no
+per-rule RNG.
 
-Those two decisions are the only randomness there is, and they read it from one place: an optional
-`random` function on the server, defaulting to `Math.random`. That is the whole of the seeding
-mechanism as far as the proxy core is concerned — it knows nothing about seeds, only that it was
-handed a source of numbers in `[0, 1)`.
+The reset is deliberately taken before forwarding begins rather than part-way through a request
+body or a response. Mid-stream failure is a different feature with its own state to manage, and
+this one is a socket the proxy destroys before it has opened anything.
+
+Those three decisions are the only randomness there is, and they read it from one place: an
+optional `random` function on the server, defaulting to `Math.random`. That is the whole of the
+seeding mechanism as far as the proxy core is concerned — it knows nothing about seeds, only that
+it was handed a source of numbers in `[0, 1)`.
 
 `src/random/seeded.ts` is what the command line hands it for `--seed`. It hashes the seed string
 to a 32-bit integer with FNV-1a over the string's UTF-16 code units and steps a Mulberry32
@@ -197,9 +219,13 @@ because a seed describes one run rather than how an API should misbehave, and a 
 checked in and shared is the wrong place for it. `--seed` requires a non-empty value: an empty one
 would fall back to ordinary randomness while looking exactly like a reproducible run.
 
-There is one generator per run and both decisions draw from it in order, so a request consumes one
-or two values depending on what happened to it and the sequence follows the order requests reach
-the decision. Reproducibility is therefore promised for the same request sequence in the same
+There is one generator per run and every decision draws from it in order, so a request consumes
+one, two or three values depending on what happened to it and the sequence follows the order
+requests reach the decision. Adding the reset decision at the front of that order deliberately
+changed what an existing seed means: a seed replayed against this version produces a different
+sequence from the same seed before connection resets existed. Reproducibility is a promise about
+repeating a run with the same version and settings, not about a seed meaning the same thing across
+versions, and the seeded tests pin the current order rather than pretending the old one survived. Reproducibility is therefore promised for the same request sequence in the same
 order, not for an arbitrary set of concurrent requests: two requests in flight at once may reach
 the decision in either order and swap outcomes between runs. Making that irrelevant would mean
 deriving each request's draws from the request itself, which is a different feature and not this
@@ -215,16 +241,30 @@ out-of-range value fails that one request with a `500` rather than taking the pr
 The proxy core prints nothing. A second optional hook, `onRequestComplete`, reports what happened
 to each request that completed — method, pathname, status, duration, outcome, and the artificial
 latency that actually applied — and a caller that does not supply it gets no output at all. The
-outcome is one of four values: `forwarded` (the upstream answered, whatever it answered),
-`injected:error`, `injected:timeout`, and `upstream:error`. The event carries facts and no
-formatting; `src/cli/log.ts` is where they become a line, so timestamps, alignment and durations
-rounded for reading all live on the command-line side and the config layer never sees them.
+outcome is one of five values: `forwarded` (the upstream answered, whatever it answered),
+`injected:error`, `injected:timeout`, `connection:reset`, and `upstream:error`. The event carries
+facts and no formatting; `src/cli/log.ts` is where they become a line, so timestamps, alignment and
+durations rounded for reading all live on the command-line side and the config layer never sees
+them.
+
+`statusCode` is `number | null` rather than `number`, which is a real change to the public event
+shape. `null` is only ever a `connection:reset`: that request received no HTTP response, so there
+is no status to report. It is nullable rather than optional so the key is always present — an event
+is a fixed set of facts about one request, and a field that disappears would make consumers
+distinguish "no status" from "an older version that did not report one". No number is invented for
+it either: `0`, `499` and `444` would each claim an HTTP answer that never happened, and the CLI
+prints `RESET` in that column instead.
 
 Emission hangs off the response's own `close` event, which fires exactly once, so an error path
 and a completion path cannot both report the same request. Whether that close was a completion or
 a disconnect is read from `writableFinished`: a request the client abandoned mid-response reports
 nothing rather than a status it never received, and neither does one abandoned during a delay,
-where the proxy never chose an outcome at all. Durations come from `performance.now()`, measured
+where the proxy never chose an outcome at all. A reset is the one outcome that cannot wait for
+that close — the socket is about to be destroyed, so the response never becomes `writableFinished`
+and the close that follows is indistinguishable from a client hanging up — so it is emitted the
+moment it is recorded, guarded by a flag that keeps the close listener from reporting it twice.
+That is what keeps a reset the proxy chose from being misread as a client that went away, without
+giving up exactly-once emission. Durations come from `performance.now()`, measured
 from the moment the request arrives, so an adjusted system clock cannot produce a negative one.
 The two paths where the proxy refuses a request before choosing any outcome — an unparsable
 request target, and a `resolveChaos` hook that cannot produce usable options — report nothing,
@@ -258,7 +298,10 @@ only: the config file has no `logging` section, because a per-run choice about t
 not belong in a file describing how an API should misbehave.
 
 Randomised or ranged delays and timeout durations, choosing between multiple or weighted error
-statuses, method- or host-specific rules, and connection failures do not exist yet. Neither do
+statuses, and method- or host-specific rules do not exist yet. Nor do the connection failures this
+one is not: refusing connections outright, resetting part-way through a request body or a response,
+half-open sockets, configurable or per-rule reset timing, packet loss, bandwidth throttling, and
+upstream-side connection failures after forwarding has begun. Neither do
 structured or JSON logs, log files, log levels, request IDs, tracing, metrics, or naming the rule
 that matched in a log line; nor config auto-discovery, JSON config, environment variables, hot
 reload, or merging several matching rules: a config file is used only when `--config` names it.

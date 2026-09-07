@@ -1,7 +1,7 @@
 import { execFile, spawn } from 'node:child_process';
 import type { ChildProcessByStdio } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { createServer } from 'node:http';
+import { createServer, request as httpRequest } from 'node:http';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -197,18 +197,26 @@ async function startUpstream(
     res.writeHead(200, { 'content-type': 'text/plain' });
     res.end('upstream ok');
   },
-): Promise<{ origin: string; requests: IncomingMessage[] }> {
+): Promise<{ origin: string; requests: IncomingMessage[]; connectionCount: () => number }> {
   const requests: IncomingMessage[] = [];
   const server = createServer((req, res) => {
     requests.push(req);
     handler(req, res);
+  });
+  let connections = 0;
+  server.on('connection', () => {
+    connections += 1;
   });
   openServers.add(server);
   await new Promise<void>((resolve) => {
     server.listen(0, '127.0.0.1', resolve);
   });
 
-  return { origin: `http://127.0.0.1:${addressOf(server).port}`, requests };
+  return {
+    origin: `http://127.0.0.1:${addressOf(server).port}`,
+    requests,
+    connectionCount: () => connections,
+  };
 }
 
 /** Binds a loopback port and releases it, so nothing is listening there. */
@@ -284,6 +292,45 @@ async function fetchWhenListening(url: string): Promise<Response> {
       await sleep(50);
     }
   }
+}
+
+/** What one raw request through the built CLI got back. */
+interface RequestAttempt {
+  /** Status the client received, or `undefined` if it never got a response. */
+  readonly statusCode: number | undefined;
+  /** Whether the request failed at the transport level instead. */
+  readonly failed: boolean;
+}
+
+/**
+ * Sends a request with the raw client and reports whether it got a response.
+ *
+ * `fetch` turns every transport failure into the same opaque `TypeError`, which
+ * cannot tell a connection the proxy dropped from a proxy that is not running.
+ * Which error code the platform produces is deliberately not asserted on.
+ */
+function attempt(url: string): Promise<RequestAttempt> {
+  return new Promise<RequestAttempt>((resolve, reject) => {
+    const req = httpRequest(url, (res) => {
+      res.resume();
+      res.once('end', () => {
+        resolve({ statusCode: res.statusCode, failed: false });
+      });
+      res.once('error', () => {
+        resolve({ statusCode: res.statusCode, failed: false });
+      });
+    });
+
+    req.on('error', () => {
+      resolve({ statusCode: undefined, failed: true });
+    });
+
+    req.end();
+    setTimeout(() => {
+      req.destroy();
+      reject(new Error(`timed out waiting for ${url}`));
+    }, WAIT_TIMEOUT_MS).unref();
+  });
 }
 
 describe('package bin entry', () => {
@@ -655,7 +702,11 @@ rules:
  * the duration are real and stay unpinned.
  */
 function loggedOutcomes(cli: CliProcess): string[] {
-  return [...cli.stdout().matchAll(/-> \d{3} \d+ms (\S+)/g)].map((match) => match[1] ?? '');
+  // `RESET` stands where a status would be for a connection the proxy dropped:
+  // that request never received one, so there is no number to match on.
+  return [...cli.stdout().matchAll(/-> (?:\d{3}|RESET) \d+ms (\S+)/g)].map(
+    (match) => match[1] ?? '',
+  );
 }
 
 /** Waits until the CLI has logged `count` completed requests. */
@@ -762,15 +813,17 @@ describe('the built CLI with --seed', () => {
     expect(first.outcomes).toEqual(second.outcomes);
 
     // Pinned from the generator, so this is a promise about which requests
-    // fail rather than only about two runs agreeing with each other.
-    expect(first.statuses).toEqual([200, 200, 200, 500, 500, 500]);
+    // fail rather than only about two runs agreeing with each other. The reset
+    // decision draws first even at a rate of 0, so these are not the values
+    // this seed produced before connection resets existed.
+    expect(first.statuses).toEqual([500, 200, 504, 504, 500, 200]);
     expect(first.outcomes).toEqual([
-      'forwarded',
-      'forwarded',
-      'forwarded',
       'injected:error',
+      'forwarded',
+      'injected:timeout',
+      'injected:timeout',
       'injected:error',
-      'injected:error',
+      'forwarded',
     ]);
   }, 60_000);
 
@@ -781,7 +834,7 @@ describe('the built CLI with --seed', () => {
     const other = await runSeeded(upstream.origin, 'other-seed', 6);
 
     expect(checkout.statuses).not.toEqual(other.statuses);
-    expect(other.statuses).toEqual([500, 200, 200, 504, 200, 504]);
+    expect(other.statuses).toEqual([500, 200, 200, 500, 500, 504]);
   }, 60_000);
 
   it('rejects an empty seed rather than running unseeded', async () => {
@@ -835,7 +888,7 @@ describe('the built CLI with --seed', () => {
 
     // The same sequence the announced run produced, from a run that announced
     // nothing at all.
-    expect(statuses).toEqual([200, 200, 200, 500, 500, 500]);
+    expect(statuses).toEqual([500, 200, 504, 504, 500, 200]);
     expect(cli.stdout()).toBe('');
     expect(cli.stderr()).toBe('');
   }, 30_000);
@@ -904,7 +957,9 @@ describe('the built CLI with --preset', () => {
     const upstream = await startUpstream();
     const { cli, baseUrl } = await startPresetCli(upstream.origin, 'slow-api');
 
-    expect(cli.stdout()).toContain('Latency: 1000ms');
+    // Waited for rather than read straight off, because startup lines can
+    // arrive in separate chunks and this one comes after the preset line.
+    await waitForOutput(cli, 'Latency: 1000ms');
 
     const startedAt = performance.now();
     const response = await fetch(`${baseUrl}/api/users`);
@@ -992,9 +1047,15 @@ describe('the built CLI with --preset', () => {
   }, 30_000);
 });
 
+/**
+ * Seed for the preset run below, chosen so that the preset's 25% actually
+ * selects some of six requests and the pinned sequence says something.
+ */
+const PRESET_SEED = 'flaky-test';
+
 /** Drives one preset-and-seed run through `count` requests, one at a time. */
 async function runSeededPreset(target: string, count: number): Promise<SeededRun> {
-  const { cli, baseUrl } = await startPresetCli(target, 'flaky-api', ['--seed', 'checkout-test']);
+  const { cli, baseUrl } = await startPresetCli(target, 'flaky-api', ['--seed', PRESET_SEED]);
   const statuses: number[] = [];
 
   for (let index = 0; index < count; index += 1) {
@@ -1028,12 +1089,176 @@ describe('the built CLI with --preset and --seed', () => {
     // than only that two runs agreed with each other.
     expect(first.outcomes).toEqual([
       'forwarded',
-      'forwarded',
+      'injected:error',
       'forwarded',
       'injected:error',
       'injected:error',
       'forwarded',
     ]);
-    expect(first.statuses).toEqual([200, 200, 200, 503, 503, 200]);
+    expect(first.statuses).toEqual([200, 503, 200, 503, 503, 200]);
   }, 60_000);
+});
+
+describe('the built CLI with --reset-rate', () => {
+  it('documents the option in its help', async () => {
+    const cli = startCli(['--help']);
+
+    await expect(cli.exit).resolves.toMatchObject({ code: 0 });
+    expect(cli.stdout()).toContain('--reset-rate <0-1>');
+    expect(cli.stdout()).toContain('Probability of abruptly resetting the client');
+  }, 20_000);
+
+  it('refuses a rate outside 0-1 and never listens', async () => {
+    const port = await findFreePort();
+    const cli = startCli([
+      '--target',
+      'http://localhost:3000',
+      '--port',
+      String(port),
+      '--reset-rate',
+      '5',
+    ]);
+
+    const { code } = await cli.exit;
+
+    expect(code).toBe(1);
+    expect(cli.stdout()).toBe('');
+    expect(cli.stderr()).toContain('Invalid --reset-rate 5');
+    expect(cli.stderr()).not.toContain('at ');
+  }, 20_000);
+
+  it('announces the rate at startup only when resets are actually switched on', async () => {
+    const upstream = await startUpstream();
+    const { cli } = await startProxyCli(
+      upstream.origin,
+      ['--reset-rate', '0.25'],
+      'Connection resets: 25%',
+    );
+
+    expect(cli.stdout()).toContain('Connection resets: 25%');
+
+    const quiet = await startProxyCli(upstream.origin, ['--reset-rate', '0']);
+
+    expect(quiet.cli.stdout()).not.toContain('Connection resets');
+
+    const none = await startProxyCli(upstream.origin);
+
+    expect(none.cli.stdout()).not.toContain('Connection resets');
+  }, 40_000);
+
+  it('drops the client connection without contacting the upstream, and keeps running', async () => {
+    const upstream = await startUpstream();
+    const { cli, baseUrl } = await startProxyCli(
+      upstream.origin,
+      ['--reset-rate', '1'],
+      'Connection resets: 100%',
+    );
+
+    const result = await attempt(`${baseUrl}/api/users`);
+
+    // A transport failure rather than an HTTP response: no status reached the
+    // client at all, injected or otherwise.
+    expect(result.failed).toBe(true);
+    expect(result.statusCode).toBeUndefined();
+
+    await waitForOutcomes(cli, 1);
+
+    // Exactly one line, and it says what actually happened.
+    expect(loggedOutcomes(cli)).toEqual(['connection:reset']);
+    expect(cli.stdout()).toMatch(/GET\s+\/api\/users -> RESET \d+ms connection:reset/);
+    expect(cli.stdout()).not.toContain('-> 502');
+    expect(cli.stdout()).not.toContain('-> 500');
+
+    // The upstream was never dialled, let alone sent a request. The wait is
+    // what makes that an assertion rather than a race with the dial.
+    await sleep(100);
+    expect(upstream.requests).toHaveLength(0);
+    expect(upstream.connectionCount()).toBe(0);
+
+    // A second request proves the process survived destroying a socket.
+    const again = await attempt(`${baseUrl}/api/users`);
+    expect(again.failed).toBe(true);
+    await waitForOutcomes(cli, 2);
+    expect(loggedOutcomes(cli)).toEqual(['connection:reset', 'connection:reset']);
+
+    // And it still shuts down cleanly.
+    cli.child.kill('SIGINT');
+    await expect(cli.exit).resolves.toMatchObject({ code: 0, signal: null });
+    expect(cli.stderr()).toBe('');
+  }, 40_000);
+
+  it('leaves forwarding untouched at a rate of 0', async () => {
+    const upstream = await startUpstream();
+    const { cli, baseUrl } = await startProxyCli(upstream.origin, ['--reset-rate', '0']);
+
+    const response = await fetch(`${baseUrl}/api/users`);
+
+    expect(response.status).toBe(200);
+    await expect(response.text()).resolves.toBe('upstream ok');
+    expect(upstream.requests.map((request) => request.url)).toEqual(['/api/users']);
+
+    cli.child.kill('SIGINT');
+    await expect(cli.exit).resolves.toMatchObject({ code: 0 });
+  }, 30_000);
+});
+
+describe('the built CLI with a resetRate rule', () => {
+  it('resets the paths a rule names and forwards everything else', async () => {
+    const upstream = await startUpstream();
+    const configPath = writeTempConfig(`target: ${upstream.origin}
+
+rules:
+  - match: /reset/*
+    resetRate: 1
+`);
+    const port = await findFreePort();
+    const cli = startCli(['--config', configPath, '--port', String(port)]);
+    await waitForOutput(cli, 'Rules: 1');
+
+    const baseUrl = `http://127.0.0.1:${port}`;
+    const healthy = await fetch(`${baseUrl}/healthy`);
+
+    expect(healthy.status).toBe(200);
+    await expect(healthy.text()).resolves.toBe('upstream ok');
+
+    const reset = await attempt(`${baseUrl}/reset/test`);
+
+    expect(reset.failed).toBe(true);
+    expect(reset.statusCode).toBeUndefined();
+
+    await waitForOutcomes(cli, 2);
+    expect(loggedOutcomes(cli)).toEqual(['forwarded', 'connection:reset']);
+
+    // Only the healthy request ever reached the upstream. A per-rule reset is
+    // not summarised at startup, so nothing there mentions one either.
+    expect(upstream.requests.map((request) => request.url)).toEqual(['/healthy']);
+    expect(cli.stdout()).not.toContain('Connection resets');
+
+    cli.child.kill('SIGINT');
+    await expect(cli.exit).resolves.toMatchObject({ code: 0, signal: null });
+  }, 30_000);
+
+  it('lets --reset-rate 0 switch off a config file that resets everything', async () => {
+    const upstream = await startUpstream();
+    const configPath = writeTempConfig(`target: ${upstream.origin}
+
+defaults:
+  resetRate: 1
+`);
+    const port = await findFreePort();
+    const cli = startCli(['--config', configPath, '--port', String(port), '--reset-rate', '0']);
+    await waitForOutput(cli, `Config: ${configPath}`);
+
+    // The flag typed on the spot is the final word, so nothing is reset and
+    // startup says nothing about resets either.
+    expect(cli.stdout()).not.toContain('Connection resets');
+
+    const response = await fetch(`http://127.0.0.1:${port}/api/users`);
+
+    expect(response.status).toBe(200);
+    await expect(response.text()).resolves.toBe('upstream ok');
+
+    cli.child.kill('SIGINT');
+    await expect(cli.exit).resolves.toMatchObject({ code: 0 });
+  }, 30_000);
 });

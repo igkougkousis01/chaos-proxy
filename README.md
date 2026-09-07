@@ -3,10 +3,11 @@
 A local developer tool for testing how an application behaves when its API misbehaves.
 
 > **Status: under development.** Chaos Proxy runs from the command line and can forward HTTP
-> traffic to a target API, inject a fixed artificial latency, inject synthetic HTTP errors, and
-> inject synthetic timeouts — globally, or per endpoint through a YAML config file — printing one
-> line per request as it goes. Named presets cover the common scenarios, and `--seed` makes a run
-> reproducible. Connection failures do not exist yet.
+> traffic to a target API, inject a fixed artificial latency, inject synthetic HTTP errors, inject
+> synthetic timeouts, and abruptly reset client connections — globally, or per endpoint through a
+> YAML config file — printing one line per request as it goes. Named presets cover the common
+> scenarios, and `--seed` makes a run reproducible. Refusing connections outright and mid-stream
+> failures do not exist yet.
 
 Chaos Proxy sits between an application and an API and deliberately degrades that connection, so
 that loading states, retries, error handling, and timeout behaviour can be exercised locally.
@@ -93,6 +94,7 @@ never reachable from the rest of the network. That is deliberate and not configu
 | `--error-status <400-599>` | `500`      | Status code used by injected errors.                            |
 | `--timeout-rate <0-1>`     | `0`        | Fraction of requests held open and then timed out.              |
 | `--timeout <ms>`           | `30000`    | How long a timed-out request is held before it gets a `504`.    |
+| `--reset-rate <0-1>`       | `0`        | Fraction of requests whose client connection is abruptly reset. |
 | `--seed <value>`           |            | Make chaos decisions deterministic, for reproducible runs.      |
 | `--quiet`                  |            | Print nothing but errors.                                       |
 | `-h`, `--help`             |            | Print usage and exit.                                           |
@@ -113,14 +115,20 @@ application is being exercised:
 12:41:03 GET    /api/users -> 200 42ms forwarded
 12:41:07 POST   /api/payments/123 -> 503 510ms injected:error
 12:41:09 GET    /api/search -> 504 2104ms injected:timeout
+12:41:11 GET    /api/cart -> RESET 12ms connection:reset
 12:41:12 GET    /api/profile -> 200 548ms forwarded latency:+500ms
 ```
 
 Local time, method, path, the status the client received, how long the whole request took, and
-what became of it. The outcome is one of `forwarded`, `injected:error`, `injected:timeout` or
-`upstream:error` — an upstream `500` is `forwarded`, because the upstream chose it. `latency:+N`
-is appended when an artificial delay applied, and shows the value that actually applied, so a
-request an endpoint rule slowed down reports the rule's latency rather than the default.
+what became of it. The outcome is one of `forwarded`, `injected:error`, `injected:timeout`,
+`connection:reset` or `upstream:error` — an upstream `500` is `forwarded`, because the upstream
+chose it. `latency:+N` is appended when an artificial delay applied, and shows the value that
+actually applied, so a request an endpoint rule slowed down reports the rule's latency rather
+than the default.
+
+A reset request never received a status, so `RESET` stands where one would be. That is a
+transport outcome rather than an HTTP one, and no status code is invented for it — `0`, `499` and
+`444` would each claim an answer the client never got.
 
 Query strings are left out, and so are headers, bodies and anything else that could carry a token
 or a cookie into a terminal. A request whose client disconnects before the response completes
@@ -178,6 +186,9 @@ It is called exactly once per request, after the response has completed, and nev
 whose response was cut short. `durationMs` is measured on a monotonic clock and left unrounded;
 formatting it — and the timestamp next to it — is the caller's job. This is exactly how the CLI's
 request output is implemented, so the core never learns what a terminal is.
+
+`statusCode` is `number | null`. It is `null` only for a `connection:reset`, which received no
+HTTP response at all; every other outcome carries the status the client was actually sent.
 
 ### Per-request chaos
 
@@ -282,31 +293,77 @@ sent.
 This is a deliberately stalled request, not detection of a genuinely slow upstream: the proxy
 never contacts the target for a timed-out request.
 
-### Ordering
-
-Chaos is applied in a fixed order, and each request gets **at most one** injected outcome:
-
-```text
-request -> latency delay -> timeout? -> error? -> forward upstream
-```
-
-Any latency delay is paid first. Then the timeout rate is evaluated; if it selects the request,
-it is held and answered with `504`, and the error rate never gets to decide. Only requests that
-are not timed out are offered to the error rate, and only requests that neither selects are
-forwarded. So `--latency 100 --timeout-rate 1 --timeout 3000` makes a request wait roughly
-3.1 seconds and then fail with `504`.
-
-The two rates are therefore sequential rather than independent overall probabilities.
-`--timeout-rate 0.2 --error-rate 0.5` means 20% of requests time out, and half of the remaining
-80% — 40% overall — receive a synthetic error.
-
 Omitting `--timeout-rate` (or setting it to `0`) means requests are never timed out. Rates outside
 `0`-`1`, `NaN`, and infinities are rejected when the server is created, as are negative, `NaN`,
 and infinite timeout durations. A timeout of `0` is accepted and means the `504` is sent on the
 next timer tick, without waiting.
 
-Random or ranged timeout durations, jitter, and dropped or reset TCP connections are not
-supported. Per-endpoint timeouts are configured with a [config file](#config-file).
+Random or ranged timeout durations and jitter are not supported. Per-endpoint timeouts are
+configured with a [config file](#config-file).
+
+## Connection reset injection
+
+`--reset-rate` (`resetRate`) is the probability, from `0` to `1`, that a request has its client
+connection abruptly terminated. Selected requests have their client connection abruptly
+terminated without an HTTP response.
+
+```bash
+chaos-proxy \
+  --target http://localhost:3000 \
+  --reset-rate 0.1
+```
+
+```ts
+const server = createProxyServer({
+  target: 'http://localhost:5000',
+  resetRate: 0.1, // roughly 1 request in 10 loses its connection
+});
+```
+
+```text
+Chaos Proxy listening on http://127.0.0.1:4000
+Target: http://localhost:3000
+Connection resets: 10%
+12:41:11 GET    /api/cart -> RESET 12ms connection:reset
+```
+
+This is a transport failure rather than an HTTP one. No status line, no headers and no body are
+sent, so the client sees a dropped connection — a `fetch` rejection, a `curl` "connection reset by
+peer" — rather than a response it could inspect or retry on the strength of. Applications that
+only handle `5xx` are exactly what this is for.
+
+No upstream connection is opened and the request body is never read, let alone forwarded or
+buffered: whatever of it was still in flight goes with the socket. The proxy itself stays healthy
+and keeps serving the next request as usual.
+
+### Ordering
+
+Chaos is applied in a fixed order, and each request gets **at most one** injected outcome:
+
+```text
+request -> latency delay -> reset? -> timeout? -> error? -> forward upstream
+```
+
+Any latency delay is paid first. Then the reset rate is evaluated; if it selects the request, the
+connection is destroyed and neither the timeout rate nor the error rate gets to decide — there is
+nothing left to hold open or to answer. Only requests it declines are offered to the timeout rate,
+only requests that survive both are offered to the error rate, and only requests none of the three
+selects are forwarded. So `--latency 100 --reset-rate 1` makes a request wait roughly 100 ms and
+then lose its connection, and `--latency 100 --timeout-rate 1 --timeout 3000` makes one wait
+roughly 3.1 seconds and then fail with `504`.
+
+The rates are therefore sequential rather than independent overall probabilities.
+`--timeout-rate 0.2 --error-rate 0.5` means 20% of requests time out, and half of the remaining
+80% — 40% overall — receive a synthetic error. `--reset-rate 0.1` in front of them takes its 10%
+first, and the other two divide up what is left.
+
+Omitting `--reset-rate` (or setting it to `0`) means connections are never reset. Rates outside
+`0`-`1`, `NaN`, and infinities are rejected when the server is created, by exactly the same
+validator as every other rate.
+
+The reset happens before any forwarding begins. Resetting a connection part-way through a request
+body or a response, refusing connections outright, half-open sockets, and configurable reset
+timing are all out of scope. Per-endpoint resets are configured with a [config file](#config-file).
 
 ## Presets
 
@@ -333,6 +390,9 @@ Error injection: 25% -> 503
 | `flaky-api`     | 25% of requests fail with `503`              |
 | `timeout-heavy` | 30% of requests are held 3000 ms, then `504` |
 | `backend-down`  | 100% of requests fail with `503`             |
+
+No built-in preset resets connections, so applying one never starts dropping them; combine
+`--reset-rate` with a preset if that is what you want.
 
 `backend-down` is a synthetic failure like any other: the proxy answers `503` itself, and the
 target is never contacted. Nothing is done to the connection or to the target, so the upstream can
@@ -418,10 +478,16 @@ quietly ignored.
 
 ### What is and is not promised
 
-There is one generator per run, and both chaos decisions draw from it in the documented order —
-the timeout decision, then the error decision if the timeout decision declined. A request
-therefore consumes one or two values depending on what happened to it, and the sequence follows
-the order requests reach that decision.
+There is one generator per run, and every chaos decision draws from it in the documented order —
+the reset decision, then the timeout decision if the reset decision declined, then the error
+decision if the timeout decision declined too. A request therefore consumes one, two or three
+values depending on what happened to it, and the sequence follows the order requests reach that
+decision.
+
+**Adding a decision changes what an existing seed means.** Connection resets introduced a third
+draw at the front of that order, so a seed replayed against this version produces a different
+sequence from the same seed on an earlier one. Reproducibility is a promise about repeating a run
+with the same version and settings, not about a seed meaning the same thing forever.
 
 **Concurrent request ordering can change which request consumes which random value.** Two
 requests in flight at once may reach the decision in either order, so the outcomes can swap
@@ -469,6 +535,9 @@ rules:
   - match: /api/payments/*
     errorRate: 1
     errorStatus: 503
+
+  - match: /api/upload/*
+    resetRate: 0.5
 ```
 
 ```bash
@@ -479,12 +548,14 @@ chaos-proxy --config chaos.yml
 Chaos Proxy listening on http://127.0.0.1:4000
 Target: http://localhost:3000
 Config: /home/you/project/chaos.yml
-Rules: 1
+Rules: 2
 Latency: 100ms
 ```
 
-Every request is now delayed by 100 ms, and anything under `/api/payments/` fails with `503`
-instead of being forwarded. A relative path is resolved against the directory you run the command
+Every request is now delayed by 100 ms, anything under `/api/payments/` fails with `503` instead
+of being forwarded, and half the requests under `/api/upload/` lose their connection. The startup
+summary describes what applies to a request no rule matches, so per-rule rates are left in the
+file rather than reprinted. A relative path is resolved against the directory you run the command
 from. There is no auto-discovery: a config file is used only when `--config` names it.
 
 [`examples/chaos.yml`](examples/chaos.yml) is a complete file to copy.
@@ -499,8 +570,8 @@ from. There is no auto-discovery: a config file is used only when `--config` nam
 | `rules`    | list   | Endpoint rules, tried in order. Each needs a `match`.      |
 
 `defaults` and each rule accept the chaos settings `latencyMs`, `errorRate`, `errorStatus`,
-`timeoutRate` and `timeoutMs` — the same names, meanings and ranges as the `createProxyServer`
-options below, validated by the same code. Any other field, at any level, is a mistake and is
+`timeoutRate`, `timeoutMs` and `resetRate` — the same names, meanings and ranges as the
+`createProxyServer` options below, validated by the same code. Any other field, at any level, is a mistake and is
 reported as one rather than being ignored:
 
 ```text
@@ -588,19 +659,20 @@ npm run dev -- --target http://localhost:3000 --latency 500
 
 ## Project status
 
-| Area                | Status                            |
-| ------------------- | --------------------------------- |
-| Project scaffolding | Done                              |
-| CLI                 | Done (flags, startup, shutdown)   |
-| HTTP forwarding     | Done                              |
-| Latency injection   | Fixed delay                       |
-| Error injection     | Fixed status, fixed probability   |
-| Timeout injection   | Fixed duration, fixed probability |
-| Config files        | YAML, with endpoint rules         |
-| Presets             | Four built-in scenarios           |
-| Request logging     | One line per completed request    |
-| Reproducibility     | `--seed`, per request sequence    |
-| Other chaos         | Not started                       |
+| Area                | Status                               |
+| ------------------- | ------------------------------------ |
+| Project scaffolding | Done                                 |
+| CLI                 | Done (flags, startup, shutdown)      |
+| HTTP forwarding     | Done                                 |
+| Latency injection   | Fixed delay                          |
+| Error injection     | Fixed status, fixed probability      |
+| Timeout injection   | Fixed duration, fixed probability    |
+| Connection resets   | Fixed probability, before forwarding |
+| Config files        | YAML, with endpoint rules            |
+| Presets             | Four built-in scenarios              |
+| Request logging     | One line per completed request       |
+| Reproducibility     | `--seed`, per request sequence       |
+| Other chaos         | Not started                          |
 
 ## License
 

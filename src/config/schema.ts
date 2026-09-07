@@ -66,6 +66,7 @@ const CHAOS_FIELDS = [
   'errorStatus',
   'timeoutRate',
   'timeoutMs',
+  'resetRate',
 ] as const satisfies readonly (keyof ChaosOptions)[];
 
 /** Fields one entry of `rules` may contain. */

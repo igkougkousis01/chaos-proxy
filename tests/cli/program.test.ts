@@ -134,6 +134,39 @@ describe('runCli --version', () => {
   });
 });
 
+describe('runCli --reset-rate', () => {
+  it('offers it in the help, next to the other chaos flags', async () => {
+    const io = captureIo();
+
+    await expect(runCli(['--help'], io)).resolves.toBe(0);
+
+    const help = io.stdout.join('\n');
+    expect(help).toContain('--reset-rate <0-1>');
+    expect(help).toContain('Probability of abruptly resetting the client');
+  });
+
+  it('reports a rate the proxy core rejects in terms of the flag, without starting', async () => {
+    const io = captureIo();
+
+    await expect(
+      runCli(['--target', 'http://localhost:3000', '--reset-rate', '5'], io),
+    ).resolves.toBe(1);
+
+    expect(io.stdout).toEqual([]);
+    expect(io.stderr[0]).toContain('Invalid --reset-rate 5');
+  });
+
+  it('reports a rate that is not a number as a usage mistake', async () => {
+    const io = captureIo();
+
+    await expect(
+      runCli(['--target', 'http://localhost:3000', '--reset-rate', 'often'], io),
+    ).resolves.toBe(1);
+
+    expect(io.stderr[0]).toContain('--reset-rate');
+  });
+});
+
 describe('runCli usage errors', () => {
   it('refuses to start without a target', async () => {
     const io = captureIo();

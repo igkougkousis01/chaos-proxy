@@ -110,6 +110,43 @@ describe('formatRequestLog', () => {
     expect(line).toBe('12:41:03 GET    /api/users -> 502 3ms upstream:error');
   });
 
+  it('prints a connection reset as a transport outcome rather than a status', () => {
+    const line = formatRequestLog(
+      event({
+        pathname: '/api/cart',
+        statusCode: null,
+        durationMs: 12,
+        outcome: 'connection:reset',
+      }),
+      AT,
+    );
+
+    expect(line).toBe('12:41:03 GET    /api/cart -> RESET 12ms connection:reset');
+  });
+
+  it('never invents a status code for a request that received none', () => {
+    const line = formatRequestLog(event({ statusCode: null, outcome: 'connection:reset' }), AT);
+
+    // `0`, `499` and `444` would all read as a status the client was sent.
+    expect(line).not.toMatch(/-> \d/);
+    expect(line).toContain('-> RESET');
+  });
+
+  it('still appends the effective latency to a reset', () => {
+    const line = formatRequestLog(
+      event({
+        pathname: '/api/cart',
+        statusCode: null,
+        durationMs: 512,
+        outcome: 'connection:reset',
+        latencyMs: 500,
+      }),
+      AT,
+    );
+
+    expect(line).toBe('12:41:03 GET    /api/cart -> RESET 512ms connection:reset latency:+500ms');
+  });
+
   it('rounds fractional durations and latencies to whole milliseconds', () => {
     expect(formatRequestLog(event({ durationMs: 41.6, latencyMs: 0.4 }), AT)).toBe(
       '12:41:03 GET    /api/users -> 200 42ms forwarded latency:+0ms',

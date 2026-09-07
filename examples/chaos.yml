@@ -1,8 +1,9 @@
 # Chaos Proxy config: chaos-proxy --config examples/chaos.yml
 #
-# Every request is slowed by 100ms. Payments always fail with 503, and search
-# always stalls for 2s. The first rule whose "match" fits the request path wins,
-# and any flag on the command line beats everything here.
+# Every request is slowed by 100ms. Payments always fail with 503, search always
+# stalls for 2s, and uploads always lose their connection. The first rule whose
+# "match" fits the request path wins, and any flag on the command line beats
+# everything here.
 
 target: http://localhost:3000
 
@@ -21,3 +22,8 @@ rules:
   - match: /api/payments/*
     errorRate: 1
     errorStatus: 503
+
+  # A transport failure rather than an HTTP one: the client connection is
+  # destroyed without a status, and the upstream is never contacted.
+  - match: /api/upload/*
+    resetRate: 1

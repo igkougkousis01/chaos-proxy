@@ -73,7 +73,14 @@ describe('preset validity', () => {
       errorStatus: 503,
       timeoutRate: 0,
       timeoutMs: 30_000,
+      resetRate: 0,
     });
+  });
+
+  // Connection resets are a chaos option like any other, but no built-in preset
+  // asks for one, so applying a preset can never start dropping connections.
+  it.each([...PRESET_NAMES])('leaves connection resets switched off in %s', (name) => {
+    expect(resolveChaosOptions(presetChaos(name)).resetRate).toBe(0);
   });
 });
 

@@ -98,6 +98,8 @@ Options:
   --error-status <400-599>  Status code used by injected errors. Default: 500.
   --timeout-rate <0-1>      Fraction of requests held open and then timed out.
   --timeout <ms>            How long a timed-out request is held. Default: 30000.
+  --reset-rate <0-1>        Probability of abruptly resetting the client
+                            connection, with no HTTP response at all.
   --seed <value>            Use deterministic chaos decisions for reproducible
                             test runs.
   --quiet                   Print nothing but errors, which still go to stderr.
@@ -106,7 +108,8 @@ Options:
 
 The proxy listens on ${LISTEN_HOST} only, so it is never exposed to the network.
 Each request receives at most one injected outcome, decided in this order:
-latency delay, then timeout, then error, then forwarding upstream.
+latency delay, then connection reset, then timeout, then error, then forwarding
+upstream. A reset request is never contacted upstream and receives no status.
 
 With --seed those decisions come from a seeded generator instead: the same seed,
 the same settings and the same order of requests replay the same outcomes.
@@ -115,6 +118,7 @@ Every completed request prints one line, unless --quiet is given:
 
   12:41:03 GET    /api/users -> 200 42ms forwarded
   12:41:07 POST   /api/payments/123 -> 503 510ms injected:error latency:+500ms
+  12:41:11 GET    /api/cart -> RESET 12ms connection:reset
 
 A config file adds per-endpoint rules; the first rule whose "match" fits the
 request path wins.
@@ -157,6 +161,7 @@ const FLAG_FOR_PROXY_OPTION: Readonly<Record<string, string>> = {
   errorStatus: 'error-status',
   timeoutRate: 'timeout-rate',
   timeoutMs: 'timeout',
+  resetRate: 'reset-rate',
 };
 
 /**
@@ -270,6 +275,7 @@ export function parseCliArgs(argv: readonly string[]): ParsedCli {
         'error-status': { type: 'string' },
         'timeout-rate': { type: 'string' },
         timeout: { type: 'string' },
+        'reset-rate': { type: 'string' },
         seed: { type: 'string' },
         quiet: { type: 'boolean' },
         help: { type: 'boolean', short: 'h' },
@@ -335,6 +341,7 @@ export function parseCliArgs(argv: readonly string[]): ParsedCli {
   const errorStatus = optionalNumber(values['error-status'], 'error-status');
   const timeoutRate = optionalNumber(values['timeout-rate'], 'timeout-rate');
   const timeoutMs = optionalNumber(values.timeout, 'timeout');
+  const resetRate = optionalNumber(values['reset-rate'], 'reset-rate');
 
   // Flags that were not given are left off entirely rather than passed as
   // `undefined`, so a config value or the proxy core's own default can apply.
@@ -344,6 +351,7 @@ export function parseCliArgs(argv: readonly string[]): ParsedCli {
     ...(errorStatus !== undefined ? { errorStatus } : {}),
     ...(timeoutRate !== undefined ? { timeoutRate } : {}),
     ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+    ...(resetRate !== undefined ? { resetRate } : {}),
   };
 
   return {

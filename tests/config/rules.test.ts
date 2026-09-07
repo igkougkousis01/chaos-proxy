@@ -277,6 +277,10 @@ describe('the documented example config', () => {
       timeoutRate: 1,
       timeoutMs: 2000,
     });
+    expect(chaosFor(config, '/api/upload/avatar.png')).toMatchObject({
+      latencyMs: 100,
+      resetRate: 1,
+    });
     expect(chaosFor(config, '/api/users')).toEqual({ latencyMs: 100 });
   });
 });

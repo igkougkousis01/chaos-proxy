@@ -30,10 +30,12 @@ describe('parseConfig', () => {
         errorStatus: 500,
         timeoutRate: 0.05,
         timeoutMs: 3000,
+        resetRate: 0.01,
       },
       rules: [
         { match: '/api/payments/*', latencyMs: 500, errorRate: 0.5, errorStatus: 503 },
         { match: '/api/search', timeoutRate: 1, timeoutMs: 2000 },
+        { match: '/api/upload/*', resetRate: 1 },
       ],
     });
 
@@ -46,10 +48,12 @@ describe('parseConfig', () => {
         errorStatus: 500,
         timeoutRate: 0.05,
         timeoutMs: 3000,
+        resetRate: 0.01,
       },
       rules: [
         { match: '/api/payments/*', chaos: { latencyMs: 500, errorRate: 0.5, errorStatus: 503 } },
         { match: '/api/search', chaos: { timeoutRate: 1, timeoutMs: 2000 } },
+        { match: '/api/upload/*', chaos: { resetRate: 1 } },
       ],
     });
   });
@@ -167,6 +171,10 @@ describe('parseConfig', () => {
       [{ timeoutMs: -1 }, /defaults\.timeoutMs/],
       [{ latencyMs: Number.NaN }, /defaults\.latencyMs/],
       [{ timeoutMs: Number.POSITIVE_INFINITY }, /defaults\.timeoutMs/],
+      [{ resetRate: 5 }, /defaults\.resetRate 5: expected a number between 0 and 1/],
+      [{ resetRate: -0.1 }, /defaults\.resetRate/],
+      [{ resetRate: Number.NaN }, /defaults\.resetRate/],
+      [{ resetRate: Number.POSITIVE_INFINITY }, /defaults\.resetRate/],
     ])('rejects defaults of %j', (defaults, expected) => {
       expect(() => parseConfig({ target: TARGET, defaults })).toThrow(ConfigError);
       expect(() => parseConfig({ target: TARGET, defaults })).toThrow(expected);
@@ -254,10 +262,29 @@ describe('parseConfig', () => {
       [{ errorStatus: 200 }, /rules\[0\]\.errorStatus/],
       [{ timeoutRate: -1 }, /rules\[0\]\.timeoutRate/],
       [{ latencyMs: Number.NaN }, /rules\[0\]\.latencyMs/],
+      [{ resetRate: 1.5 }, /rules\[0\]\.resetRate/],
+      [{ resetRate: Number.NEGATIVE_INFINITY }, /rules\[0\]\.resetRate/],
     ])('rejects invalid chaos %j inside a rule', (chaos, expected) => {
       expect(() => parseConfig({ target: TARGET, rules: [{ match: '/a', ...chaos }] })).toThrow(
         expected,
       );
+    });
+
+    it('accepts a resetRate on a rule of its own', () => {
+      expect(parseConfig({ target: TARGET, rules: [{ match: '/reset/*', resetRate: 1 }] })).toEqual(
+        {
+          target: TARGET,
+          port: undefined,
+          defaults: {},
+          rules: [{ match: '/reset/*', chaos: { resetRate: 1 } }],
+        },
+      );
+    });
+
+    it('rejects a resetRate of the wrong type inside a rule', () => {
+      expect(() =>
+        parseConfig({ target: TARGET, rules: [{ match: '/a', resetRate: '1' }] }),
+      ).toThrow('Invalid config: rules[0].resetRate must be a number.');
     });
 
     it('rejects a chaos value of the wrong type inside a rule', () => {

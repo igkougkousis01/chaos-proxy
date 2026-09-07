@@ -206,6 +206,101 @@ rules:
   });
 });
 
+describe('connection reset precedence', () => {
+  it('passes --reset-rate straight through when nothing else has an opinion', () => {
+    const command = resolve(['--target', 'http://localhost:3000', '--reset-rate', '0.25']);
+
+    expect(command.proxy.resetRate).toBe(0.25);
+  });
+
+  it('leaves resets absent when the flag was not given', () => {
+    const command = resolve(['--target', 'http://localhost:3000']);
+
+    // Absent rather than `0`, so the proxy core's own default applies.
+    expect(command.proxy.resetRate).toBeUndefined();
+  });
+
+  it('takes resetRate from the config defaults', () => {
+    const path = writeConfig('target: http://localhost:3000\ndefaults:\n  resetRate: 0.1\n');
+
+    expect(resolve(['--config', path]).proxy.resetRate).toBe(0.1);
+  });
+
+  it('applies a rule resetRate on top of the defaults', () => {
+    const path = writeConfig(`target: http://localhost:3000
+
+defaults:
+  latencyMs: 100
+
+rules:
+  - match: /api/payments/*
+    resetRate: 0.5
+`);
+    const command = resolve(['--config', path]);
+
+    expect(chaosFor(command, '/api/payments/123')).toEqual({ latencyMs: 100, resetRate: 0.5 });
+    expect(chaosFor(command, '/api/users')).toEqual({ latencyMs: 100 });
+  });
+
+  it('prefers --reset-rate over the config defaults', () => {
+    const path = writeConfig('target: http://localhost:3000\ndefaults:\n  resetRate: 1\n');
+
+    expect(resolve(['--config', path, '--reset-rate', '0']).proxy.resetRate).toBe(0);
+  });
+
+  it('lets --reset-rate 0 switch a rule off everywhere', () => {
+    const path = writeConfig(`target: http://localhost:3000
+
+defaults:
+  resetRate: 1
+
+rules:
+  - match: /api/payments/*
+    resetRate: 1
+`);
+    const command = resolve(['--config', path, '--reset-rate', '0']);
+
+    expect(command.proxy.resetRate).toBe(0);
+    expect(chaosFor(command, '/api/payments/123')).toEqual({ resetRate: 0 });
+    expect(chaosFor(command, '/api/users')).toEqual({ resetRate: 0 });
+  });
+
+  it('leaves a rule resetRate in place when the flag says nothing about it', () => {
+    const path = writeConfig(`target: http://localhost:3000
+
+rules:
+  - match: /api/payments/*
+    resetRate: 1
+`);
+    const command = resolve(['--config', path, '--latency', '50']);
+
+    expect(chaosFor(command, '/api/payments/123')).toEqual({ resetRate: 1, latencyMs: 50 });
+  });
+
+  it('leaves resets alone under a preset, which none of them define', () => {
+    const path = writeConfig('target: http://localhost:3000\ndefaults:\n  resetRate: 0.2\n');
+    const command = resolve(['--config', path, '--preset', 'backend-down']);
+
+    // A preset only applies the fields its own scenario is about, and no
+    // built-in one is about connections.
+    expect(command.proxy.resetRate).toBe(0.2);
+    expect(command.proxy.errorRate).toBe(1);
+  });
+
+  it('lets --reset-rate sit alongside a preset without either disturbing the other', () => {
+    const command = resolve([
+      '--target',
+      'http://localhost:3000',
+      '--preset',
+      'slow-api',
+      '--reset-rate',
+      '0.3',
+    ]);
+
+    expect(command.proxy).toMatchObject({ latencyMs: 1000, resetRate: 0.3 });
+  });
+});
+
 describe('reporting the config in use', () => {
   it('reports the absolute path and how many rules it holds', () => {
     const path = writeConfig(

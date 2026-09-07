@@ -110,6 +110,13 @@ function startupLines(listeningOn: string, command: ResolvedCommand): string[] {
     lines.push(`Latency: ${proxy.latencyMs}ms`);
   }
 
+  // First of the chaos lines, matching the order the decisions are taken in:
+  // a reset is chosen before anything else, and there is no shape to report
+  // alongside it — the connection either goes or it does not.
+  if (proxy.resetRate !== undefined && proxy.resetRate > 0) {
+    lines.push(`Connection resets: ${asPercentage(proxy.resetRate)}`);
+  }
+
   if (proxy.errorRate !== undefined && proxy.errorRate > 0) {
     const status = proxy.errorStatus === undefined ? '' : ` -> ${proxy.errorStatus}`;
     lines.push(`Error injection: ${asPercentage(proxy.errorRate)}${status}`);
