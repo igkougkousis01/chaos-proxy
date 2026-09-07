@@ -17,6 +17,15 @@ export interface ProxyServerOptions {
    * Only the origin is used; any path on the target is ignored.
    */
   readonly target: string;
+
+  /**
+   * Fixed artificial delay, in milliseconds, applied once per request before
+   * the upstream request is opened. Omitted or `0` means no delay.
+   *
+   * The delay only postpones the start of forwarding; request and response
+   * bodies still stream through untouched.
+   */
+  readonly latencyMs?: number;
 }
 
 /**
@@ -62,6 +71,25 @@ function parseTarget(target: string): URL {
   }
 
   return url;
+}
+
+/**
+ * Validates the configured latency and normalises "no latency" to `0`.
+ *
+ * @throws {RangeError} If the latency is negative, `NaN`, or infinite.
+ */
+function parseLatencyMs(latencyMs: number | undefined): number {
+  if (latencyMs === undefined) {
+    return 0;
+  }
+
+  if (!Number.isFinite(latencyMs) || latencyMs < 0) {
+    throw new RangeError(
+      `Invalid latencyMs ${String(latencyMs)}: expected a finite number of milliseconds >= 0.`,
+    );
+  }
+
+  return latencyMs;
 }
 
 /**
@@ -173,6 +201,32 @@ function forward(req: IncomingMessage, res: ServerResponse, target: URL): void {
 }
 
 /**
+ * Waits `latencyMs` before forwarding, so the artificial delay is paid once at
+ * request initiation rather than per body chunk.
+ *
+ * The incoming request is left unread while waiting, so its body stays in the
+ * socket under normal backpressure instead of being buffered here. If the
+ * client goes away first, the timer is cleared and no upstream request is made.
+ */
+function forwardAfter(
+  latencyMs: number,
+  req: IncomingMessage,
+  res: ServerResponse,
+  target: URL,
+): void {
+  const timer = setTimeout(() => {
+    res.off('close', cancel);
+    forward(req, res, target);
+  }, latencyMs);
+
+  function cancel(): void {
+    clearTimeout(timer);
+  }
+
+  res.once('close', cancel);
+}
+
+/**
  * Creates a proxy server that forwards every request to `target` and streams
  * the upstream response back to the client.
  *
@@ -180,11 +234,18 @@ function forward(req: IncomingMessage, res: ServerResponse, target: URL): void {
  * and stop it with `server.close()`.
  *
  * @throws {TypeError} If `target` is not an absolute `http:` or `https:` URL.
+ * @throws {RangeError} If `latencyMs` is negative, `NaN`, or infinite.
  */
 export function createProxyServer(options: ProxyServerOptions): Server {
   const target = parseTarget(options.target);
+  const latencyMs = parseLatencyMs(options.latencyMs);
 
   return createServer((req, res) => {
-    forward(req, res, target);
+    if (latencyMs === 0) {
+      forward(req, res, target);
+      return;
+    }
+
+    forwardAfter(latencyMs, req, res, target);
   });
 }

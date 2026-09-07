@@ -1,9 +1,9 @@
 /**
  * Public entry point for the Chaos Proxy package.
  *
- * The proxy core can forward HTTP traffic to a target API. Chaos behaviour
- * (latency, errors, timeouts) and CLI configuration are added in later
- * features.
+ * The proxy core can forward HTTP traffic to a target API and inject a fixed
+ * artificial latency. Remaining chaos behaviour (errors, timeouts) and CLI
+ * configuration are added in later features.
  */
 
 export { createProxyServer } from './proxy/server.js';
