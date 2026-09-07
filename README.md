@@ -4,8 +4,8 @@ A local developer tool for testing how an application behaves when its API misbe
 
 > **Status: under development.** Chaos Proxy runs from the command line and can forward HTTP
 > traffic to a target API, inject a fixed artificial latency, inject synthetic HTTP errors, and
-> inject synthetic timeouts — globally, or per endpoint through a YAML config file. Connection
-> failures do not exist yet.
+> inject synthetic timeouts — globally, or per endpoint through a YAML config file — printing one
+> line per request as it goes. Connection failures do not exist yet.
 
 Chaos Proxy sits between an application and an API and deliberately degrades that connection, so
 that loading states, retries, error handling, and timeout behaviour can be exercised locally.
@@ -48,6 +48,7 @@ chaos-proxy --target http://localhost:3000
 ```text
 Chaos Proxy listening on http://127.0.0.1:4000
 Target: http://localhost:3000
+12:41:03 GET    /api/users -> 200 42ms forwarded
 ```
 
 Requests now travel `application -> http://127.0.0.1:4000 -> http://localhost:3000`, unchanged
@@ -67,6 +68,8 @@ Chaos Proxy listening on http://127.0.0.1:4000
 Target: http://localhost:3000
 Latency: 500ms
 Error injection: 20% -> 503
+12:41:12 GET    /api/profile -> 200 548ms forwarded latency:+500ms
+12:41:15 POST   /api/orders -> 503 520ms injected:error latency:+500ms
 ```
 
 Every request is now delayed by 500 ms, and roughly one in five is answered with `503` instead of
@@ -88,6 +91,7 @@ never reachable from the rest of the network. That is deliberate and not configu
 | `--error-status <400-599>` | `500`      | Status code used by injected errors.                            |
 | `--timeout-rate <0-1>`     | `0`        | Fraction of requests held open and then timed out.              |
 | `--timeout <ms>`           | `30000`    | How long a timed-out request is held before it gets a `504`.    |
+| `--quiet`                  |            | Print nothing but errors.                                       |
 | `-h`, `--help`             |            | Print usage and exit.                                           |
 | `-v`, `--version`          |            | Print the package version and exit.                             |
 
@@ -96,6 +100,35 @@ never reachable from the rest of the network. That is deliberate and not configu
 Invalid values are rejected before the server starts, with a message naming the option — they are
 never silently clamped. A port that is already in use is reported as such rather than as a stack
 trace.
+
+### Request output
+
+Every request that completes prints one line, so what the proxy did to it is visible while the
+application is being exercised:
+
+```text
+12:41:03 GET    /api/users -> 200 42ms forwarded
+12:41:07 POST   /api/payments/123 -> 503 510ms injected:error
+12:41:09 GET    /api/search -> 504 2104ms injected:timeout
+12:41:12 GET    /api/profile -> 200 548ms forwarded latency:+500ms
+```
+
+Local time, method, path, the status the client received, how long the whole request took, and
+what became of it. The outcome is one of `forwarded`, `injected:error`, `injected:timeout` or
+`upstream:error` — an upstream `500` is `forwarded`, because the upstream chose it. `latency:+N`
+is appended when an artificial delay applied, and shows the value that actually applied, so a
+request an endpoint rule slowed down reports the rule's latency rather than the default.
+
+Query strings are left out, and so are headers, bodies and anything else that could carry a token
+or a cookie into a terminal. A request whose client disconnects before the response completes
+prints nothing rather than a status it never received.
+
+`--quiet` turns off informational output — the startup summary, these lines, and the shutdown
+notice. Errors still go to stderr, and `--help` and `--version` still print.
+
+```bash
+chaos-proxy --target http://localhost:3000 --quiet
+```
 
 ## Proxy core
 
@@ -119,6 +152,29 @@ and `https:` targets are both supported; anything else is rejected when the serv
 the target cannot be reached, the client receives `502 Bad Gateway`.
 
 The local proxy listener itself is plain HTTP.
+
+### Request completion events
+
+The proxy core prints nothing. Pass `onRequestComplete` to be told what happened to each request
+that completed:
+
+```ts
+import { createProxyServer } from 'chaos-proxy';
+import type { RequestLogEvent } from 'chaos-proxy';
+
+const server = createProxyServer({
+  target: 'http://localhost:5000',
+  onRequestComplete: (event: RequestLogEvent) => {
+    // { method: 'GET', pathname: '/api/users', statusCode: 200,
+    //   durationMs: 42.13, outcome: 'forwarded', latencyMs: 0 }
+  },
+});
+```
+
+It is called exactly once per request, after the response has completed, and never for a request
+whose response was cut short. `durationMs` is measured on a monotonic clock and left unrounded;
+formatting it — and the timestamp next to it — is the caller's job. This is exactly how the CLI's
+request output is implemented, so the core never learns what a terminal is.
 
 ### Per-request chaos
 
@@ -392,6 +448,7 @@ npm run dev -- --target http://localhost:3000 --latency 500
 | Error injection     | Fixed status, fixed probability   |
 | Timeout injection   | Fixed duration, fixed probability |
 | Config files        | YAML, with endpoint rules         |
+| Request logging     | One line per completed request    |
 | Other chaos         | Not started                       |
 
 ## License

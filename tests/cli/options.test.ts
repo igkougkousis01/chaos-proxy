@@ -24,11 +24,17 @@ describe('parseCliArgs', () => {
       configPath: undefined,
       port: undefined,
       chaos: {},
+      quiet: false,
     });
   });
 
   it('accepts the --option=value form', () => {
     expect(parseRun([`--target=${TARGET}`]).target).toBe(TARGET);
+  });
+
+  it('reports --quiet only when it was given', () => {
+    expect(parseRun(['--target', TARGET]).quiet).toBe(false);
+    expect(parseRun(['--target', TARGET, '--quiet']).quiet).toBe(true);
   });
 
   it('reports the path given to --config', () => {

@@ -10,7 +10,7 @@ import type { AddressInfo } from 'node:net';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { createProxyServer } from '../../src/index.js';
-import type { ProxyServerOptions } from '../../src/index.js';
+import type { ProxyServerOptions, RequestLogEvent } from '../../src/index.js';
 import { shouldInjectError, shouldInjectTimeout } from '../../src/proxy/server.js';
 
 /** A request as it arrived at the temporary upstream server. */
@@ -149,6 +149,52 @@ function rawRequest(url: string, headers: OutgoingHttpHeaders): Promise<RawRespo
     req.on('error', reject);
     req.end();
   });
+}
+
+/** A proxy that records every request completion it reports. */
+interface RecordingProxy {
+  /** Base URL of the proxy, e.g. `http://127.0.0.1:53124`. */
+  readonly baseUrl: string;
+  /** Every completion event reported so far, in the order they arrived. */
+  readonly events: RequestLogEvent[];
+  /**
+   * Waits until `count` events have been reported, or gives up.
+   *
+   * A response reaching the client and the proxy finishing with it are two
+   * different moments, so a test that asserted immediately after `fetch` would
+   * be racing. Polling a recorded array bounds the wait without pinning it to a
+   * particular number of event-loop turns.
+   */
+  readonly waitForEvents: (count: number) => Promise<void>;
+}
+
+/** Starts a Chaos Proxy that records what it reports about each request. */
+async function startRecordingProxy(
+  target: string,
+  chaos: Omit<ProxyServerOptions, 'target' | 'onRequestComplete'> = {},
+): Promise<RecordingProxy> {
+  const events: RequestLogEvent[] = [];
+  const { port } = await start(
+    createProxyServer({
+      target,
+      ...chaos,
+      onRequestComplete: (event) => {
+        events.push(event);
+      },
+    }),
+  );
+
+  return {
+    baseUrl: `http://127.0.0.1:${port}`,
+    events,
+    waitForEvents: async (count) => {
+      const deadline = Date.now() + 2000;
+
+      while (events.length < count && Date.now() < deadline) {
+        await sleep(10);
+      }
+    },
+  };
 }
 
 /** Binds an ephemeral port and releases it, so nothing is listening there. */
@@ -995,5 +1041,249 @@ describe('per-request chaos', () => {
 
     expect(recovered.status).toBe(200);
     await expect(recovered.text()).resolves.toBe('upstream ok');
+  });
+});
+
+describe('request completion events', () => {
+  it('reports a forwarded request once the response has completed', async () => {
+    const upstream = await startUpstream((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/plain' });
+      res.end('upstream ok');
+    });
+    const proxy = await startRecordingProxy(upstream.origin);
+
+    const response = await fetch(`${proxy.baseUrl}/api/users`);
+    expect(response.status).toBe(200);
+    await response.text();
+    await proxy.waitForEvents(1);
+
+    expect(proxy.events).toHaveLength(1);
+    expect(proxy.events[0]).toMatchObject({
+      method: 'GET',
+      pathname: '/api/users',
+      statusCode: 200,
+      outcome: 'forwarded',
+      latencyMs: 0,
+    });
+    expect(proxy.events[0]?.durationMs).toBeGreaterThanOrEqual(0);
+  });
+
+  it('reports an upstream error status as forwarded, not as injected', async () => {
+    const upstream = await startUpstream((_req, res) => {
+      res.writeHead(418);
+      res.end('teapot');
+    });
+    const proxy = await startRecordingProxy(upstream.origin);
+
+    const response = await fetch(`${proxy.baseUrl}/api/brew`);
+    expect(response.status).toBe(418);
+    await response.text();
+    await proxy.waitForEvents(1);
+
+    // The status the upstream chose is still the upstream's answer: nothing
+    // about it was injected, and the event must not claim otherwise.
+    expect(proxy.events).toEqual([
+      expect.objectContaining({ statusCode: 418, outcome: 'forwarded' }),
+    ]);
+  });
+
+  it('reports an injected error with its status and the latency that applied', async () => {
+    const latencyMs = 40;
+    const upstream = await startUpstream((_req, res) => {
+      res.writeHead(200);
+      res.end('should not be reached');
+    });
+    const proxy = await startRecordingProxy(upstream.origin, {
+      latencyMs,
+      errorRate: 1,
+      errorStatus: 503,
+    });
+
+    const response = await fetch(`${proxy.baseUrl}/api/payments/123`, { method: 'POST' });
+    expect(response.status).toBe(503);
+    await response.text();
+    await proxy.waitForEvents(1);
+
+    expect(proxy.events).toHaveLength(1);
+    expect(proxy.events[0]).toMatchObject({
+      method: 'POST',
+      pathname: '/api/payments/123',
+      statusCode: 503,
+      outcome: 'injected:error',
+      latencyMs,
+    });
+    // Lower bound only, with slack for timer coarseness and loaded CI runners.
+    expect(proxy.events[0]?.durationMs).toBeGreaterThanOrEqual(latencyMs / 2);
+    expect(upstream.connectionCount()).toBe(0);
+  });
+
+  it('reports an injected timeout as a 504', async () => {
+    const upstream = await startUpstream((_req, res) => {
+      res.writeHead(200);
+      res.end('should not be reached');
+    });
+    const proxy = await startRecordingProxy(upstream.origin, { timeoutRate: 1, timeoutMs: 20 });
+
+    const response = await fetch(`${proxy.baseUrl}/api/search`);
+    expect(response.status).toBe(504);
+    await response.text();
+    await proxy.waitForEvents(1);
+
+    expect(proxy.events).toHaveLength(1);
+    expect(proxy.events[0]).toMatchObject({
+      pathname: '/api/search',
+      statusCode: 504,
+      outcome: 'injected:timeout',
+    });
+  });
+
+  it('reports an unreachable upstream as a 502 upstream error', async () => {
+    const port = await findUnusedPort();
+    const proxy = await startRecordingProxy(`http://127.0.0.1:${port}`);
+
+    const response = await fetch(`${proxy.baseUrl}/api/users`);
+    expect(response.status).toBe(502);
+    await response.text();
+    await proxy.waitForEvents(1);
+
+    expect(proxy.events).toHaveLength(1);
+    expect(proxy.events[0]).toMatchObject({ statusCode: 502, outcome: 'upstream:error' });
+  });
+
+  it('reports the pathname without the query string', async () => {
+    const upstream = await startUpstream((_req, res) => {
+      res.writeHead(200);
+      res.end('ok');
+    });
+    const proxy = await startRecordingProxy(upstream.origin);
+
+    await (await fetch(`${proxy.baseUrl}/api/search?q=test`)).text();
+    await proxy.waitForEvents(1);
+
+    expect(proxy.events[0]?.pathname).toBe('/api/search');
+    // The query string is still forwarded; it is only left out of the event.
+    expect(upstream.requests[0]?.url).toBe('/api/search?q=test');
+  });
+
+  it('reports the latency a per-request resolver chose, not the static one', async () => {
+    const upstream = await startUpstream((_req, res) => {
+      res.writeHead(200);
+      res.end('ok');
+    });
+    const proxy = await startRecordingProxy(upstream.origin, {
+      latencyMs: 10,
+      resolveChaos: (request) =>
+        request.url?.startsWith('/api/payments/') === true ? { latencyMs: 60 } : {},
+    });
+
+    await (await fetch(`${proxy.baseUrl}/api/payments/123`)).text();
+    await proxy.waitForEvents(1);
+    await (await fetch(`${proxy.baseUrl}/api/users`)).text();
+    await proxy.waitForEvents(2);
+
+    expect(proxy.events.map((event) => [event.pathname, event.latencyMs])).toEqual([
+      ['/api/payments/123', 60],
+      ['/api/users', 10],
+    ]);
+  });
+
+  it('reports each request exactly once', async () => {
+    const upstream = await startUpstream((_req, res) => {
+      res.writeHead(200);
+      res.end('ok');
+    });
+    const proxy = await startRecordingProxy(upstream.origin);
+
+    await (await fetch(`${proxy.baseUrl}/api/users`)).text();
+    await proxy.waitForEvents(1);
+    // Long enough for a second emission from the error path, the finish path or
+    // a re-entered close listener to have arrived if there were one.
+    await sleep(100);
+
+    expect(proxy.events).toHaveLength(1);
+  });
+
+  it('reports nothing when the client disconnects before the response completes', async () => {
+    // Headers and one chunk go out and the upstream then holds the response
+    // open, so the client can cut the connection at a point where the proxy has
+    // already decided the request was forwarded.
+    const upstream = await startUpstream((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/plain' });
+      res.write('partial');
+    });
+    const proxy = await startRecordingProxy(upstream.origin);
+
+    await new Promise<void>((resolve) => {
+      const req = httpRequest(`${proxy.baseUrl}/api/stream`, (res) => {
+        res.once('data', () => {
+          req.destroy();
+          resolve();
+        });
+      });
+      req.on('error', () => {
+        // Expected: the client aborts itself above.
+      });
+      req.end();
+    });
+
+    await sleep(100);
+
+    // A truncated response is not a completed one, and reporting it as `200`
+    // would say the client received something it never did.
+    expect(proxy.events).toEqual([]);
+  });
+
+  it('reports nothing when the client disconnects during the latency delay', async () => {
+    const latencyMs = 200;
+    const upstream = await startUpstream((_req, res) => {
+      res.writeHead(204);
+      res.end();
+    });
+    const events: RequestLogEvent[] = [];
+    const proxy = createProxyServer({
+      target: upstream.origin,
+      latencyMs,
+      onRequestComplete: (event) => {
+        events.push(event);
+      },
+    });
+    // The proxy's own handler is registered first, so by the time this resolves
+    // the delay timer has already been started for this request.
+    const delayStarted = new Promise<void>((resolve) => {
+      proxy.once('request', () => {
+        resolve();
+      });
+    });
+    const { port } = await start(proxy);
+
+    const req = httpRequest(`http://127.0.0.1:${port}/api/users`);
+    req.on('error', () => {
+      // Expected: the client aborts itself below.
+    });
+    req.end();
+
+    await delayStarted;
+    req.destroy();
+    await sleep(latencyMs * 2);
+
+    // No outcome was ever chosen for this request, so there is nothing to say
+    // about it — least of all an invented status.
+    expect(events).toEqual([]);
+  });
+
+  it('stays silent when no completion hook is given', async () => {
+    const upstream = await startUpstream((_req, res) => {
+      res.writeHead(200);
+      res.end('ok');
+    });
+    const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    const error = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const proxyUrl = await startProxy(upstream.origin);
+
+    await (await fetch(`${proxyUrl}/api/users`)).text();
+    await sleep(50);
+
+    expect(log).not.toHaveBeenCalled();
+    expect(error).not.toHaveBeenCalled();
   });
 });

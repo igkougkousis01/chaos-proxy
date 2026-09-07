@@ -12,7 +12,16 @@
  * is a consumer of this API and translates its YAML config — defaults plus
  * ordered endpoint rules — into exactly such a hook. Remaining chaos behaviour
  * (connection failures) is added in later features.
+ *
+ * The proxy prints nothing on its own. An optional `onRequestComplete` hook
+ * reports what happened to each completed request, and the command line is what
+ * turns those facts into the lines it prints.
  */
 
 export { createProxyServer } from './proxy/server.js';
-export type { ChaosOptions, ProxyServerOptions } from './proxy/server.js';
+export type {
+  ChaosOptions,
+  ProxyServerOptions,
+  RequestLogEvent,
+  RequestOutcome,
+} from './proxy/server.js';
