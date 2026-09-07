@@ -16,7 +16,7 @@ Chaos Proxy should eventually support:
 - **Latency injection** — add fixed or randomised delays to responses. _(fixed delays
   implemented)_
 - **HTTP error injection** — return chosen status codes (500, 503, 429, …) instead of real
-  responses.
+  responses. _(a single fixed status, at a fixed probability, implemented)_
 - **Request timeouts** — hold a request open so the client hits its own timeout.
 - **Connection failures** — refuse, drop, or reset connections.
 - **Endpoint-specific rules** — apply different chaos behaviour per path, method, or pattern.
@@ -76,9 +76,17 @@ Prettier) and a placeholder CLI entry point that prints the tool name.
 upstream response back, preserving method, path, query string, body, and headers. Unreachable
 targets produce a `502 Bad Gateway` instead of crashing the process.
 
-The first chaos behaviour also lives there: an optional `latencyMs` option adds a fixed
-artificial delay before the upstream request is opened, leaving body streaming untouched. It is
-programmatic only. Randomised delays, error injection, timeouts, per-endpoint rules,
-configuration loading, and CLI argument parsing do not exist yet.
+The chaos behaviour implemented so far also lives there, and is programmatic only:
+
+- `latencyMs` adds a fixed artificial delay before the upstream request is opened, leaving body
+  streaming untouched.
+- `errorRate` and `errorStatus` answer that fraction of requests with a synthetic HTTP error
+  (default `500`, plain text) instead of forwarding them, without opening an upstream connection.
+  The decision is made per request, after the latency delay, so an injected failure can arrive
+  slowly.
+
+Randomised delays, choosing between multiple or weighted error statuses, per-endpoint or
+per-method rules, timeouts, connection failures, configuration loading, and CLI argument parsing
+do not exist yet.
 
 It is built on `node:http` and `node:https` with no runtime dependencies.

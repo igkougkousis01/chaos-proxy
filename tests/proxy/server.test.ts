@@ -11,6 +11,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import { createProxyServer } from '../../src/index.js';
 import type { ProxyServerOptions } from '../../src/index.js';
+import { shouldInjectError } from '../../src/proxy/server.js';
 
 /** A request as it arrived at the temporary upstream server. */
 interface RecordedRequest {
@@ -107,9 +108,11 @@ async function startUpstream(
 }
 
 /** Starts a Chaos Proxy pointed at `target` and returns its base URL. */
-async function startProxy(target: string, latencyMs?: number): Promise<string> {
-  const options: ProxyServerOptions = latencyMs === undefined ? { target } : { target, latencyMs };
-  const { port } = await start(createProxyServer(options));
+async function startProxy(
+  target: string,
+  chaos: Omit<ProxyServerOptions, 'target'> = {},
+): Promise<string> {
+  const { port } = await start(createProxyServer({ target, ...chaos }));
 
   return `http://127.0.0.1:${port}`;
 }
@@ -189,6 +192,32 @@ describe('createProxyServer', () => {
 
   it.each([0, 250, 0.5])('accepts a latencyMs of %p', (latencyMs) => {
     expect(() => createProxyServer({ target: 'http://localhost:5000', latencyMs })).not.toThrow();
+  });
+
+  it.each([-0.1, 1.1, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY])(
+    'rejects an errorRate of %p',
+    (errorRate) => {
+      expect(() => createProxyServer({ target: 'http://localhost:5000', errorRate })).toThrow(
+        RangeError,
+      );
+    },
+  );
+
+  it.each([0, 0.25, 1])('accepts an errorRate of %p', (errorRate) => {
+    expect(() => createProxyServer({ target: 'http://localhost:5000', errorRate })).not.toThrow();
+  });
+
+  it.each([399, 600, 500.5, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY])(
+    'rejects an errorStatus of %p',
+    (errorStatus) => {
+      expect(() => createProxyServer({ target: 'http://localhost:5000', errorStatus })).toThrow(
+        RangeError,
+      );
+    },
+  );
+
+  it.each([400, 429, 500, 503, 599])('accepts an errorStatus of %p', (errorStatus) => {
+    expect(() => createProxyServer({ target: 'http://localhost:5000', errorStatus })).not.toThrow();
   });
 });
 
@@ -354,7 +383,7 @@ describe('latency injection', () => {
       res.writeHead(204);
       res.end();
     });
-    const proxyUrl = await startProxy(upstream.origin, 100);
+    const proxyUrl = await startProxy(upstream.origin, { latencyMs: 100 });
 
     const startedAt = performance.now();
     const response = await fetch(`${proxyUrl}/api/users`);
@@ -370,7 +399,7 @@ describe('latency injection', () => {
       res.writeHead(201, { 'content-type': 'application/json', 'x-upstream': 'yes' });
       res.end(JSON.stringify({ id: 7 }));
     });
-    const proxyUrl = await startProxy(upstream.origin, 50);
+    const proxyUrl = await startProxy(upstream.origin, { latencyMs: 50 });
     const payload = JSON.stringify({ name: 'ada' });
 
     const response = await fetch(`${proxyUrl}/api/users?page=2`, {
@@ -421,5 +450,144 @@ describe('latency injection', () => {
     // The stronger signal: without cancellation the proxy still dials upstream
     // after the delay, even though the aborted body pipe stops the headers.
     expect(upstream.connectionCount()).toBe(0);
+  });
+});
+
+describe('shouldInjectError', () => {
+  it.each([
+    [0.25, true],
+    [0.75, false],
+  ])('injects for a random value of %p at an errorRate of 0.5: %p', (value, expected) => {
+    expect(shouldInjectError(0.5, () => value)).toBe(expected);
+  });
+
+  it('never injects at an errorRate of 0', () => {
+    expect(shouldInjectError(0, () => 0)).toBe(false);
+  });
+
+  it('always injects at an errorRate of 1', () => {
+    // The largest value Math.random() can return is just below 1.
+    expect(shouldInjectError(1, () => 0.999999999999999)).toBe(true);
+  });
+});
+
+describe('error injection', () => {
+  it('forwards every request when errorRate is 0', async () => {
+    const upstream = await startUpstream((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/plain' });
+      res.end('ok');
+    });
+    const proxyUrl = await startProxy(upstream.origin, { errorRate: 0 });
+
+    for (const path of ['/one', '/two', '/three']) {
+      const response = await fetch(`${proxyUrl}${path}`);
+      expect(response.status).toBe(200);
+      await expect(response.text()).resolves.toBe('ok');
+    }
+
+    expect(upstream.requests).toHaveLength(3);
+  });
+
+  it('answers with a synthetic error and never reaches the upstream when errorRate is 1', async () => {
+    const upstream = await startUpstream((_req, res) => {
+      res.writeHead(200);
+      res.end('should not be reached');
+    });
+    const proxyUrl = await startProxy(upstream.origin, { errorRate: 1 });
+
+    const response = await fetch(`${proxyUrl}/api/users?page=2`);
+
+    expect(response.status).toBe(500);
+    expect(response.headers.get('content-type')).toBe('text/plain; charset=utf-8');
+    await expect(response.text()).resolves.toBe('Chaos Proxy injected error');
+    expect(upstream.requests).toHaveLength(0);
+    expect(upstream.connectionCount()).toBe(0);
+  });
+
+  it('rejects a request with a body without forwarding or hanging', async () => {
+    const upstream = await startUpstream((_req, res) => {
+      res.writeHead(200);
+      res.end('should not be reached');
+    });
+    const proxyUrl = await startProxy(upstream.origin, { errorRate: 1 });
+
+    const response = await fetch(`${proxyUrl}/api/users`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'ada' }),
+    });
+
+    expect(response.status).toBe(500);
+    await expect(response.text()).resolves.toBe('Chaos Proxy injected error');
+    expect(upstream.requests).toHaveLength(0);
+    expect(upstream.connectionCount()).toBe(0);
+
+    // The proxy is still serving, so the unread body did not wedge it.
+    const next = await fetch(`${proxyUrl}/api/users`);
+    expect(next.status).toBe(500);
+  });
+
+  it('returns the configured errorStatus', async () => {
+    const upstream = await startUpstream((_req, res) => {
+      res.writeHead(200);
+      res.end('should not be reached');
+    });
+    const proxyUrl = await startProxy(upstream.origin, { errorRate: 1, errorStatus: 503 });
+
+    const response = await fetch(`${proxyUrl}/api/users`);
+
+    expect(response.status).toBe(503);
+    await expect(response.text()).resolves.toBe('Chaos Proxy injected error');
+    expect(upstream.requests).toHaveLength(0);
+  });
+
+  it('injects the error only after the configured latency has elapsed', async () => {
+    const upstream = await startUpstream((_req, res) => {
+      res.writeHead(200);
+      res.end('should not be reached');
+    });
+    const proxyUrl = await startProxy(upstream.origin, { latencyMs: 100, errorRate: 1 });
+
+    const startedAt = performance.now();
+    const response = await fetch(`${proxyUrl}/api/users`);
+    const elapsed = performance.now() - startedAt;
+
+    expect(response.status).toBe(500);
+    await expect(response.text()).resolves.toBe('Chaos Proxy injected error');
+    // Lower bound only, with slack for timer coarseness and loaded CI runners.
+    expect(elapsed).toBeGreaterThanOrEqual(75);
+    expect(upstream.requests).toHaveLength(0);
+    expect(upstream.connectionCount()).toBe(0);
+  });
+
+  it('injects nothing when the client disconnects during the delay', async () => {
+    const latencyMs = 200;
+    const upstream = await startUpstream((_req, res) => {
+      res.writeHead(200);
+      res.end('should not be reached');
+    });
+    const proxy = createProxyServer({ target: upstream.origin, latencyMs, errorRate: 1 });
+    const delayStarted = new Promise<void>((resolve) => {
+      proxy.once('request', () => {
+        resolve();
+      });
+    });
+    const { port } = await start(proxy);
+    const proxyUrl = `http://127.0.0.1:${port}`;
+
+    const req = httpRequest(`${proxyUrl}/api/users`);
+    req.on('error', () => {
+      // Expected: the client aborts itself below.
+    });
+    req.end();
+
+    await delayStarted;
+    req.destroy();
+    await sleep(latencyMs * 2);
+
+    expect(upstream.connectionCount()).toBe(0);
+    // Writing to the gone client did not take the proxy down.
+    const response = await fetch(`${proxyUrl}/api/users`);
+    expect(response.status).toBe(500);
   });
 });

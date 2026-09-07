@@ -26,6 +26,20 @@ export interface ProxyServerOptions {
    * bodies still stream through untouched.
    */
   readonly latencyMs?: number;
+
+  /**
+   * Probability, from `0` to `1`, that a request is answered with a synthetic
+   * error instead of being forwarded upstream. Omitted or `0` means never.
+   *
+   * The decision is made per request, after any {@link latencyMs} delay.
+   */
+  readonly errorRate?: number;
+
+  /**
+   * Status code returned by an injected error. Must be an integer HTTP error
+   * status in the `400`-`599` range. Defaults to `500`.
+   */
+  readonly errorStatus?: number;
 }
 
 /**
@@ -47,6 +61,12 @@ const HOP_BY_HOP_HEADERS: ReadonlySet<string> = new Set([
 
 /** Base used to parse the request target; only its path and query are kept. */
 const REQUEST_TARGET_BASE = 'http://request.invalid';
+
+/** Status returned by an injected error when `errorStatus` is omitted. */
+const DEFAULT_ERROR_STATUS = 500;
+
+/** Body of an injected error response, so it is recognisable in a client. */
+const INJECTED_ERROR_BODY = 'Chaos Proxy injected error';
 
 /**
  * Parses and validates the configured target.
@@ -90,6 +110,65 @@ function parseLatencyMs(latencyMs: number | undefined): number {
   }
 
   return latencyMs;
+}
+
+/**
+ * Validates the configured error rate and normalises "never" to `0`.
+ *
+ * Invalid values are rejected rather than clamped, so a typo cannot silently
+ * turn into a different amount of chaos.
+ *
+ * @throws {RangeError} If the rate is outside `0`-`1`, `NaN`, or infinite.
+ */
+function parseErrorRate(errorRate: number | undefined): number {
+  if (errorRate === undefined) {
+    return 0;
+  }
+
+  if (!Number.isFinite(errorRate) || errorRate < 0 || errorRate > 1) {
+    throw new RangeError(
+      `Invalid errorRate ${String(errorRate)}: expected a number between 0 and 1 inclusive.`,
+    );
+  }
+
+  return errorRate;
+}
+
+/**
+ * Validates the configured error status and applies the default.
+ *
+ * Only client and server error statuses are accepted: injecting a success or
+ * redirect status would not exercise an application's failure handling.
+ *
+ * @throws {RangeError} If the status is not an integer in the `400`-`599` range.
+ */
+function parseErrorStatus(errorStatus: number | undefined): number {
+  if (errorStatus === undefined) {
+    return DEFAULT_ERROR_STATUS;
+  }
+
+  if (!Number.isInteger(errorStatus) || errorStatus < 400 || errorStatus > 599) {
+    throw new RangeError(
+      `Invalid errorStatus ${String(errorStatus)}: expected an integer HTTP error status between 400 and 599.`,
+    );
+  }
+
+  return errorStatus;
+}
+
+/**
+ * Decides whether one request should receive a synthetic error.
+ *
+ * This is the only randomness in the proxy. Keeping it in a single pure
+ * function keeps `Math.random()` out of the forwarding path and makes partial
+ * rates testable without statistical assertions. `Math.random()` returns a
+ * value in `[0, 1)`, so a rate of `0` never injects and a rate of `1` always
+ * does.
+ *
+ * @internal Not part of the public API; configure via {@link createProxyServer}.
+ */
+export function shouldInjectError(errorRate: number, random: () => number = Math.random): boolean {
+  return random() < errorRate;
 }
 
 /**
@@ -201,22 +280,23 @@ function forward(req: IncomingMessage, res: ServerResponse, target: URL): void {
 }
 
 /**
- * Waits `latencyMs` before forwarding, so the artificial delay is paid once at
- * request initiation rather than per body chunk.
+ * Waits `latencyMs` before running `initiate`, so the artificial delay is paid
+ * once at request initiation rather than per body chunk.
  *
  * The incoming request is left unread while waiting, so its body stays in the
  * socket under normal backpressure instead of being buffered here. If the
- * client goes away first, the timer is cleared and no upstream request is made.
+ * client goes away first, the timer is cleared: nothing is decided, no upstream
+ * request is made, and no response is written to the gone client.
  */
-function forwardAfter(
+function initiateAfter(
   latencyMs: number,
   req: IncomingMessage,
   res: ServerResponse,
-  target: URL,
+  initiate: (req: IncomingMessage, res: ServerResponse) => void,
 ): void {
   const timer = setTimeout(() => {
     res.off('close', cancel);
-    forward(req, res, target);
+    initiate(req, res);
   }, latencyMs);
 
   function cancel(): void {
@@ -235,17 +315,37 @@ function forwardAfter(
  *
  * @throws {TypeError} If `target` is not an absolute `http:` or `https:` URL.
  * @throws {RangeError} If `latencyMs` is negative, `NaN`, or infinite.
+ * @throws {RangeError} If `errorRate` is outside `0`-`1`, `NaN`, or infinite.
+ * @throws {RangeError} If `errorStatus` is not an integer from `400` to `599`.
  */
 export function createProxyServer(options: ProxyServerOptions): Server {
   const target = parseTarget(options.target);
   const latencyMs = parseLatencyMs(options.latencyMs);
+  const errorRate = parseErrorRate(options.errorRate);
+  const errorStatus = parseErrorStatus(options.errorStatus);
 
-  return createServer((req, res) => {
-    if (latencyMs === 0) {
-      forward(req, res, target);
+  /**
+   * Starts one request: either it fails synthetically, or it is forwarded.
+   *
+   * An injected error answers from here, so no upstream connection is opened
+   * and no request body is read; Node discards the unread body as part of
+   * ending the response.
+   */
+  function initiate(req: IncomingMessage, res: ServerResponse): void {
+    if (shouldInjectError(errorRate)) {
+      sendProxyError(res, errorStatus, INJECTED_ERROR_BODY);
       return;
     }
 
-    forwardAfter(latencyMs, req, res, target);
+    forward(req, res, target);
+  }
+
+  return createServer((req, res) => {
+    if (latencyMs === 0) {
+      initiate(req, res);
+      return;
+    }
+
+    initiateAfter(latencyMs, req, res, initiate);
   });
 }
