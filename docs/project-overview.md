@@ -62,11 +62,18 @@ src/
 ```
 
 This is a target, not a starting point. The repository deliberately keeps the minimum structure
-needed today (`src/index.ts` and `src/cli.ts`); each directory above is created when the feature
-that needs it is implemented, rather than up front as empty scaffolding.
+needed today (`src/index.ts`, `src/cli.ts`, and `src/proxy/`); each remaining directory above is
+created when the feature that needs it is implemented, rather than up front as empty scaffolding.
 
 ## Current status
 
 The repository is bootstrapped with the Node.js + TypeScript toolchain (ESM, Vitest, ESLint,
-Prettier) and a placeholder CLI entry point that prints the tool name. No proxying or chaos
-behaviour exists yet.
+Prettier) and a placeholder CLI entry point that prints the tool name.
+
+`src/proxy/` implements the forwarding layer: `createProxyServer({ target })` returns a Node.js
+`http.Server` that streams requests through to an `http:` or `https:` target and streams the
+upstream response back, preserving method, path, query string, body, and headers. Unreachable
+targets produce a `502 Bad Gateway` instead of crashing the process.
+
+It is built on `node:http` and `node:https` with no runtime dependencies. No chaos behaviour,
+configuration loading, or CLI argument parsing exists yet.
