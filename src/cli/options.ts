@@ -52,6 +52,11 @@ export interface CliCommand {
   readonly target: string | undefined;
   /** Chaos flags the user actually typed, and only those. */
   readonly chaos: ChaosOptions;
+  /**
+   * Seed given to `--seed`, if any, kept as the opaque string it was typed as.
+   * Absent means chaos decisions stay ordinarily random.
+   */
+  readonly seed: string | undefined;
   /** Whether `--quiet` was given, silencing everything but errors. */
   readonly quiet: boolean;
 }
@@ -83,6 +88,8 @@ Options:
   --error-status <400-599>  Status code used by injected errors. Default: 500.
   --timeout-rate <0-1>      Fraction of requests held open and then timed out.
   --timeout <ms>            How long a timed-out request is held. Default: 30000.
+  --seed <value>            Use deterministic chaos decisions for reproducible
+                            test runs.
   --quiet                   Print nothing but errors, which still go to stderr.
   -h, --help                Show this help.
   -v, --version             Show the version.
@@ -90,6 +97,9 @@ Options:
 The proxy listens on ${LISTEN_HOST} only, so it is never exposed to the network.
 Each request receives at most one injected outcome, decided in this order:
 latency delay, then timeout, then error, then forwarding upstream.
+
+With --seed those decisions come from a seeded generator instead: the same seed,
+the same settings and the same order of requests replay the same outcomes.
 
 Every completed request prints one line, unless --quiet is given:
 
@@ -106,6 +116,11 @@ Examples:
     --target http://localhost:3000 \\
     --latency 500 \\
     --error-rate 0.2
+
+  ${CLI_NAME} \\
+    --target http://localhost:3000 \\
+    --error-rate 0.5 \\
+    --seed checkout-test
 
   ${CLI_NAME} --config chaos.yml`;
 
@@ -218,6 +233,7 @@ export function parseCliArgs(argv: readonly string[]): ParsedCli {
         'error-status': { type: 'string' },
         'timeout-rate': { type: 'string' },
         timeout: { type: 'string' },
+        seed: { type: 'string' },
         quiet: { type: 'boolean' },
         help: { type: 'boolean', short: 'h' },
         version: { type: 'boolean', short: 'v' },
@@ -258,6 +274,19 @@ export function parseCliArgs(argv: readonly string[]): ParsedCli {
     );
   }
 
+  const seed = values.seed;
+
+  // An empty seed is rejected rather than treated as "no seed": `--seed ""` is
+  // a value the user meant to supply and got wrong, and silently falling back
+  // to ordinary randomness would look exactly like a run that is reproducible.
+  // Anything else is taken verbatim — no trimming, no case folding — so the
+  // string in a script is the string the sequence comes from.
+  if (seed !== undefined && (typeof seed !== 'string' || seed === '')) {
+    throw new CliError(
+      'Invalid --seed: expected a non-empty value, for example --seed checkout-test.',
+    );
+  }
+
   const latencyMs = optionalNumber(values.latency, 'latency');
   const errorRate = optionalNumber(values['error-rate'], 'error-rate');
   const errorStatus = optionalNumber(values['error-status'], 'error-status');
@@ -281,6 +310,7 @@ export function parseCliArgs(argv: readonly string[]): ParsedCli {
       port: typeof values.port === 'string' ? toPort(values.port) : undefined,
       target,
       chaos,
+      seed,
       quiet: values.quiet === true,
     },
   };

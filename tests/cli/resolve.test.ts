@@ -73,6 +73,7 @@ describe('resolveCommand without a config file', () => {
       proxy: { target: 'http://localhost:3000', latencyMs: 500 },
       configPath: undefined,
       ruleCount: 0,
+      seed: undefined,
     });
   });
 
@@ -228,5 +229,75 @@ describe('config failures', () => {
     const path = writeConfig('target: http://localhost:3000\nfoo: 1\n');
 
     expect(() => resolve(['--config', path])).toThrow('Invalid config: unknown field "foo".');
+  });
+});
+
+describe('seeding', () => {
+  /** The random function a resolved command hands the proxy core. */
+  function randomOf(command: ResolvedCommand): () => number {
+    const random = command.proxy.random;
+
+    if (random === undefined) {
+      throw new Error('expected the command to supply a random function');
+    }
+
+    return random;
+  }
+
+  it('leaves the proxy on Math.random when no seed was given', () => {
+    const command = resolve(['--target', 'http://localhost:3000']);
+
+    expect(command.seed).toBeUndefined();
+    expect(command.proxy.random).toBeUndefined();
+    expect('random' in command.proxy).toBe(false);
+  });
+
+  it('turns a seed into a generator and keeps the string for reporting', () => {
+    const command = resolve(['--target', 'http://localhost:3000', '--seed', 'checkout-test']);
+
+    expect(command.seed).toBe('checkout-test');
+    expect(typeof randomOf(command)).toBe('function');
+  });
+
+  it('produces the sequence that seed stands for', () => {
+    const random = randomOf(resolve(['--target', 'http://localhost:3000', '--seed', '12345']));
+
+    expect([random(), random(), random()]).toEqual([
+      0.40825439128093421, 0.3569058203138411, 0.8735486085060984,
+    ]);
+  });
+
+  it('gives every run of the same seed the same sequence', () => {
+    const argv = ['--target', 'http://localhost:3000', '--seed', 'checkout-test'];
+    const first = randomOf(resolve(argv));
+    const second = randomOf(resolve(argv));
+
+    expect([first(), first(), first()]).toEqual([second(), second(), second()]);
+  });
+
+  it('gives different seeds different sequences', () => {
+    const first = randomOf(resolve(['--target', 'http://localhost:3000', '--seed', 'a']));
+    const second = randomOf(resolve(['--target', 'http://localhost:3000', '--seed', 'b']));
+
+    expect(first()).not.toBe(second());
+  });
+
+  it('seeds a run that also uses a config file, without touching its rules', () => {
+    const path = writeConfig(
+      'target: http://localhost:3000\nrules:\n  - match: /fail/*\n    errorRate: 1\n',
+    );
+    const command = resolve(['--config', path, '--seed', 'checkout-test']);
+
+    expect(command.seed).toBe('checkout-test');
+    expect(typeof randomOf(command)).toBe('function');
+    expect(chaosFor(command, '/fail/now')).toEqual({ errorRate: 1 });
+  });
+
+  // Seeding is a property of one run, not of how an API should misbehave, so
+  // the config file has no say in it either way.
+  it('ignores a "seed" field in the config file by rejecting it as unknown', () => {
+    const path = writeConfig('target: http://localhost:3000\nseed: checkout-test\n');
+
+    expect(() => resolve(['--config', path])).toThrow('unknown field "seed"');
   });
 });

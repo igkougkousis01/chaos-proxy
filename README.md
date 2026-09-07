@@ -5,7 +5,8 @@ A local developer tool for testing how an application behaves when its API misbe
 > **Status: under development.** Chaos Proxy runs from the command line and can forward HTTP
 > traffic to a target API, inject a fixed artificial latency, inject synthetic HTTP errors, and
 > inject synthetic timeouts — globally, or per endpoint through a YAML config file — printing one
-> line per request as it goes. Connection failures do not exist yet.
+> line per request as it goes. `--seed` makes a run reproducible. Connection failures do not exist
+> yet.
 
 Chaos Proxy sits between an application and an API and deliberately degrades that connection, so
 that loading states, retries, error handling, and timeout behaviour can be exercised locally.
@@ -91,6 +92,7 @@ never reachable from the rest of the network. That is deliberate and not configu
 | `--error-status <400-599>` | `500`      | Status code used by injected errors.                            |
 | `--timeout-rate <0-1>`     | `0`        | Fraction of requests held open and then timed out.              |
 | `--timeout <ms>`           | `30000`    | How long a timed-out request is held before it gets a `504`.    |
+| `--seed <value>`           |            | Make chaos decisions deterministic, for reproducible runs.      |
 | `--quiet`                  |            | Print nothing but errors.                                       |
 | `-h`, `--help`             |            | Print usage and exit.                                           |
 | `-v`, `--version`          |            | Print the package version and exit.                             |
@@ -305,6 +307,74 @@ next timer tick, without waiting.
 Random or ranged timeout durations, jitter, and dropped or reset TCP connections are not
 supported. Per-endpoint timeouts are configured with a [config file](#config-file).
 
+## Reproducible runs
+
+Chaos is random, which is exactly what makes an interesting failure hard to look at twice.
+`--seed` replaces the randomness with a generator built from a seed you choose, so a run can be
+repeated:
+
+```bash
+chaos-proxy \
+  --target http://localhost:3000 \
+  --error-rate 0.3 \
+  --timeout-rate 0.1 \
+  --seed checkout-test
+```
+
+```text
+Chaos Proxy listening on http://127.0.0.1:4000
+Target: http://localhost:3000
+Error injection: 30% -> 500
+Timeout injection: 10% -> 30000ms
+Seed: checkout-test
+```
+
+Using the same seed, configuration, and request order produces the same chaos decision sequence.
+Run the checkout flow, watch the third request fail, fix something, and run it again: the third
+request fails again. Without `--seed`, decisions are ordinarily random, exactly as before.
+
+The seed is an opaque string — `checkout-test`, `12345` and `abc` are all fine, and none of them
+is treated as a number. It is used exactly as typed: case and whitespace are significant, so
+`checkout-test` and `Checkout-Test` are different runs. An empty seed is rejected rather than
+quietly ignored.
+
+### What is and is not promised
+
+There is one generator per run, and both chaos decisions draw from it in the documented order —
+the timeout decision, then the error decision if the timeout decision declined. A request
+therefore consumes one or two values depending on what happened to it, and the sequence follows
+the order requests reach that decision.
+
+**Concurrent request ordering can change which request consumes which random value.** Two
+requests in flight at once may reach the decision in either order, so the outcomes can swap
+between runs. Reproducibility holds for the same request sequence in the same order — a scripted
+scenario, or an application driven the same way twice — not for an arbitrary set of concurrent
+requests.
+
+Seeding is a command-line flag only: it describes one run rather than how an API should misbehave,
+so there is no `seed` field in the [config file](#config-file), no per-rule or per-endpoint seed,
+and no per-request seeding that would make ordering irrelevant. `Seed: <value>` is printed once at
+startup and nowhere else — per-request log lines are unchanged, and no random value or draw
+counter is ever printed.
+
+The seed is not a scenario file: nothing is recorded and nothing is replayed. Change any rate, and
+the same seed will produce different outcomes, because the same numbers are being compared against
+different thresholds.
+
+Programmatically, the same thing is a `random` option — any function returning a value in
+`[0, 1)`:
+
+```ts
+const server = createProxyServer({
+  target: 'http://localhost:5000',
+  errorRate: 0.3,
+  random: myDeterministicGenerator, // defaults to Math.random
+});
+```
+
+The seeded generator behind `--seed` is internal, because a plain `() => number` is all the option
+asks for.
+
 ## Config file
 
 Different routes usually need different failure behaviour: payments should fail, search should
@@ -449,6 +519,7 @@ npm run dev -- --target http://localhost:3000 --latency 500
 | Timeout injection   | Fixed duration, fixed probability |
 | Config files        | YAML, with endpoint rules         |
 | Request logging     | One line per completed request    |
+| Reproducibility     | `--seed`, per request sequence    |
 | Other chaos         | Not started                       |
 
 ## License

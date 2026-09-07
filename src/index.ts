@@ -16,6 +16,11 @@
  * The proxy prints nothing on its own. An optional `onRequestComplete` hook
  * reports what happened to each completed request, and the command line is what
  * turns those facts into the lines it prints.
+ *
+ * Chaos decisions use `Math.random` unless an optional `random` function is
+ * supplied, which makes a run as reproducible as that function is. The command
+ * line's `--seed` is one such function; the generator behind it is internal,
+ * because a plain `() => number` is all the API asks for.
  */
 
 export { createProxyServer } from './proxy/server.js';

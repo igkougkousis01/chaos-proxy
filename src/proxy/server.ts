@@ -175,6 +175,24 @@ export interface ProxyServerOptions extends ChaosOptions {
    * status it never received.
    */
   readonly onRequestComplete?: (event: RequestLogEvent) => void;
+
+  /**
+   * Where the chaos decisions get their randomness. Defaults to `Math.random`.
+   *
+   * It must return a value in `[0, 1)`, like `Math.random` does. Supplying a
+   * deterministic generator makes the whole server reproducible: the same
+   * generator, the same options and the same sequence of requests produce the
+   * same sequence of outcomes. That is what `chaos-proxy --seed` is.
+   *
+   * There is exactly one of these per server, and both chaos decisions draw
+   * from it in a fixed order — the timeout decision first, then the error
+   * decision, and only when the timeout decision declined. A request therefore
+   * consumes one or two values depending on what happened to it, which makes
+   * the sequence depend on the order requests reach the decision. Requests
+   * handled concurrently can interleave their draws, so reproducibility holds
+   * for a given request ordering rather than for a given set of requests.
+   */
+  readonly random?: () => number;
 }
 
 /**
@@ -338,10 +356,10 @@ export function resolveChaosOptions(
  * synthetic timeout.
  *
  * This and {@link shouldInjectError} are the only randomness in the proxy, one
- * draw each. Keeping them in pure functions keeps `Math.random()` out of the
+ * draw each. Keeping them in pure functions keeps the random source out of the
  * forwarding path and makes partial rates testable without statistical
- * assertions. `Math.random()` returns a value in `[0, 1)`, so a rate of `0`
- * never injects and a rate of `1` always does.
+ * assertions. `random` returns a value in `[0, 1)`, so a rate of `0` never
+ * injects and a rate of `1` always does.
  *
  * The two draws are sequential rather than independent overall probabilities:
  * this one is taken first, and {@link shouldInjectError} is consulted only when
@@ -615,6 +633,10 @@ const CHAOS_RESOLUTION_ERROR_BODY = 'Chaos Proxy configuration error';
  * The server is silent: it prints nothing. Passing an `onRequestComplete` hook
  * is the only way to find out what it did with a request.
  *
+ * Chaos decisions use `Math.random` unless a `random` function is supplied, in
+ * which case they become as reproducible as that function is; see
+ * {@link ProxyServerOptions.random}.
+ *
  * @throws {TypeError} If `target` is not an absolute `http:` or `https:` URL.
  * @throws {RangeError} If `latencyMs` or `timeoutMs` is negative, `NaN`, or
  * infinite.
@@ -627,6 +649,10 @@ export function createProxyServer(options: ProxyServerOptions): Server {
   const staticChaos = resolveChaosOptions(options);
   const resolveChaos = options.resolveChaos;
   const onRequestComplete = options.onRequestComplete;
+  // One source for the whole server, read once: both decisions draw from it, so
+  // a seeded generator produces one reproducible stream rather than two that
+  // could drift apart.
+  const random = options.random ?? Math.random;
 
   /**
    * Starts one request, choosing exactly one outcome: a synthetic timeout, a
@@ -642,7 +668,7 @@ export function createProxyServer(options: ProxyServerOptions): Server {
     chaos: ResolvedChaosOptions,
     report: ReportOutcome,
   ): void {
-    if (shouldInjectTimeout(chaos.timeoutRate)) {
+    if (shouldInjectTimeout(chaos.timeoutRate, random)) {
       runAfter(chaos.timeoutMs, res, () => {
         report('injected:timeout');
         sendProxyError(res, INJECTED_TIMEOUT_STATUS, INJECTED_TIMEOUT_BODY);
@@ -650,7 +676,7 @@ export function createProxyServer(options: ProxyServerOptions): Server {
       return;
     }
 
-    if (shouldInjectError(chaos.errorRate)) {
+    if (shouldInjectError(chaos.errorRate, random)) {
       report('injected:error');
       sendProxyError(res, chaos.errorStatus, INJECTED_ERROR_BODY);
       return;

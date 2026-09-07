@@ -646,3 +646,197 @@ rules:
     expect(cli.stderr()).not.toContain('at ');
   }, 20_000);
 });
+
+/**
+ * The outcome of every completed request the CLI has logged, in order.
+ *
+ * The log line is the only place a built CLI says what it did with a request,
+ * and its outcome word is the part these tests care about — the timestamp and
+ * the duration are real and stay unpinned.
+ */
+function loggedOutcomes(cli: CliProcess): string[] {
+  return [...cli.stdout().matchAll(/-> \d{3} \d+ms (\S+)/g)].map((match) => match[1] ?? '');
+}
+
+/** Waits until the CLI has logged `count` completed requests. */
+async function waitForOutcomes(cli: CliProcess, count: number): Promise<void> {
+  const deadline = Date.now() + WAIT_TIMEOUT_MS;
+
+  while (loggedOutcomes(cli).length < count) {
+    if (Date.now() > deadline) {
+      throw new Error(
+        `timed out waiting for ${count} completions.\nstdout: ${cli.stdout()}\nstderr: ${cli.stderr()}`,
+      );
+    }
+
+    await sleep(20);
+  }
+}
+
+/** Chaos rates used by every seeded run below, so only the seed ever differs. */
+const SEEDED_CHAOS = [
+  '--error-rate',
+  '0.5',
+  '--timeout-rate',
+  '0.25',
+  // Short, so a run that does time out a request costs the suite nothing. It
+  // does not affect which requests are selected.
+  '--timeout',
+  '50',
+] as const;
+
+/** Starts the built CLI with a seed and waits for it to announce that seed. */
+async function startSeededCli(
+  target: string,
+  seed: string,
+): Promise<{ cli: CliProcess; baseUrl: string }> {
+  const port = await findFreePort();
+  const cli = startCli([
+    '--target',
+    target,
+    '--port',
+    String(port),
+    ...SEEDED_CHAOS,
+    '--seed',
+    seed,
+  ]);
+  await waitForOutput(cli, `Seed: ${seed}`);
+
+  return { cli, baseUrl: `http://127.0.0.1:${port}` };
+}
+
+/** What one seeded run did: the statuses the client saw and the logged fates. */
+interface SeededRun {
+  readonly statuses: number[];
+  readonly outcomes: string[];
+}
+
+/**
+ * Drives one seeded CLI through `count` requests, sent strictly one at a time.
+ *
+ * Ordering is the condition on the whole promise, so these are deliberately
+ * sequential: each request is answered and reported before the next is sent.
+ */
+async function runSeeded(target: string, seed: string, count: number): Promise<SeededRun> {
+  const { cli, baseUrl } = await startSeededCli(target, seed);
+  const statuses: number[] = [];
+
+  for (let index = 0; index < count; index += 1) {
+    const response = await fetch(`${baseUrl}/api/item/${index}`);
+    await response.text();
+    statuses.push(response.status);
+    await waitForOutcomes(cli, index + 1);
+  }
+
+  const outcomes = loggedOutcomes(cli);
+
+  cli.child.kill('SIGINT');
+  await cli.exit;
+
+  return { statuses, outcomes };
+}
+
+describe('the built CLI with --seed', () => {
+  it('documents --seed in its help', async () => {
+    const cli = startCli(['--help']);
+
+    await expect(cli.exit).resolves.toMatchObject({ code: 0 });
+    expect(cli.stdout()).toContain('--seed <value>');
+    expect(cli.stdout()).toContain('Use deterministic chaos decisions for reproducible');
+  }, 20_000);
+
+  it('announces the seed it was given', async () => {
+    const upstream = await startUpstream();
+    const { cli } = await startSeededCli(upstream.origin, 'checkout-test');
+
+    expect(cli.stdout()).toContain('Seed: checkout-test');
+  }, 30_000);
+
+  it('replays the same outcomes across two separate runs', async () => {
+    const upstream = await startUpstream();
+
+    const first = await runSeeded(upstream.origin, 'checkout-test', 6);
+    const second = await runSeeded(upstream.origin, 'checkout-test', 6);
+
+    expect(first.statuses).toEqual(second.statuses);
+    expect(first.outcomes).toEqual(second.outcomes);
+
+    // Pinned from the generator, so this is a promise about which requests
+    // fail rather than only about two runs agreeing with each other.
+    expect(first.statuses).toEqual([200, 200, 200, 500, 500, 500]);
+    expect(first.outcomes).toEqual([
+      'forwarded',
+      'forwarded',
+      'forwarded',
+      'injected:error',
+      'injected:error',
+      'injected:error',
+    ]);
+  }, 60_000);
+
+  it('produces different outcomes for a different seed', async () => {
+    const upstream = await startUpstream();
+
+    const checkout = await runSeeded(upstream.origin, 'checkout-test', 6);
+    const other = await runSeeded(upstream.origin, 'other-seed', 6);
+
+    expect(checkout.statuses).not.toEqual(other.statuses);
+    expect(other.statuses).toEqual([500, 200, 200, 504, 200, 504]);
+  }, 60_000);
+
+  it('rejects an empty seed rather than running unseeded', async () => {
+    const cli = startCli(['--target', 'http://127.0.0.1:1', '--seed', '']);
+
+    const { code } = await cli.exit;
+
+    expect(code).toBe(1);
+    expect(cli.stdout()).toBe('');
+    expect(cli.stderr()).toContain('--seed');
+    // An expected user mistake, not a crash.
+    expect(cli.stderr()).not.toContain('at ');
+  }, 20_000);
+
+  it('says nothing about seeding when no seed was given', async () => {
+    const upstream = await startUpstream();
+    const { cli, baseUrl } = await startProxyCli(upstream.origin, ['--error-rate', '0.5']);
+
+    const response = await fetch(`${baseUrl}/api/users`);
+    await response.text();
+    await waitForOutcomes(cli, 1);
+
+    expect(cli.stdout()).not.toContain('Seed');
+    expect(cli.stderr()).toBe('');
+  }, 30_000);
+
+  it('suppresses the seed line under --quiet, while still seeding the run', async () => {
+    const upstream = await startUpstream();
+    const port = await findFreePort();
+    const cli = startCli([
+      '--target',
+      upstream.origin,
+      '--port',
+      String(port),
+      ...SEEDED_CHAOS,
+      '--seed',
+      'checkout-test',
+      '--quiet',
+    ]);
+
+    const statuses: number[] = [];
+    const first = await fetchWhenListening(`http://127.0.0.1:${port}/api/item/0`);
+    await first.text();
+    statuses.push(first.status);
+
+    for (let index = 1; index < 6; index += 1) {
+      const response = await fetch(`http://127.0.0.1:${port}/api/item/${index}`);
+      await response.text();
+      statuses.push(response.status);
+    }
+
+    // The same sequence the announced run produced, from a run that announced
+    // nothing at all.
+    expect(statuses).toEqual([200, 200, 200, 500, 500, 500]);
+    expect(cli.stdout()).toBe('');
+    expect(cli.stderr()).toBe('');
+  }, 30_000);
+});

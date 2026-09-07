@@ -109,6 +109,13 @@ function startupLines(listeningOn: string, command: ResolvedCommand): string[] {
     lines.push(`Timeout injection: ${asPercentage(proxy.timeoutRate)}${held}`);
   }
 
+  // Last, because it qualifies the rates above rather than adding chaos of its
+  // own. A run with no seed says nothing: there is no default to report, and a
+  // line about randomness would only be noise on the ordinary path.
+  if (command.seed !== undefined) {
+    lines.push(`Seed: ${command.seed}`);
+  }
+
   return lines;
 }
 

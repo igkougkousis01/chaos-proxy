@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { CliError, inFlagTerms, parseCliArgs } from '../../src/cli/options.js';
+import { CliError, HELP_TEXT, inFlagTerms, parseCliArgs } from '../../src/cli/options.js';
 
 const TARGET = 'http://localhost:3000';
 
@@ -24,6 +24,7 @@ describe('parseCliArgs', () => {
       configPath: undefined,
       port: undefined,
       chaos: {},
+      seed: undefined,
       quiet: false,
     });
   });
@@ -170,6 +171,33 @@ describe('parseCliArgs', () => {
 
   it('leaves a target that is not a URL to the proxy core', () => {
     expect(parseRun(['--target', 'localhost:3000']).target).toBe('localhost:3000');
+  });
+
+  it.each(['checkout-test', '12345', 'abc', 'Checkout Test', '  padded  '])(
+    'takes --seed %j verbatim',
+    (seed) => {
+      expect(parseRun(['--target', TARGET, '--seed', seed]).seed).toBe(seed);
+    },
+  );
+
+  it('reports no seed when --seed was not given', () => {
+    expect(parseRun(['--target', TARGET]).seed).toBeUndefined();
+  });
+
+  it.each([['--seed='], ['--seed', '']])('rejects an empty seed given as %j', (...argv) => {
+    const line = ['--target', TARGET, ...argv];
+
+    expect(() => parseCliArgs(line)).toThrow(CliError);
+    expect(() => parseCliArgs(line)).toThrow(/--seed/);
+  });
+
+  it('is not a chaos option, so it never reaches the chaos block', () => {
+    expect(parseRun(['--target', TARGET, '--seed', 'checkout-test']).chaos).toEqual({});
+  });
+
+  it('documents --seed in the help text', () => {
+    expect(HELP_TEXT).toContain('--seed <value>');
+    expect(HELP_TEXT).toContain('Use deterministic chaos decisions for reproducible');
   });
 });
 
