@@ -4,6 +4,26 @@ import { CliError, HELP_TEXT, inFlagTerms, parseCliArgs } from '../../src/cli/op
 
 const TARGET = 'http://localhost:3000';
 
+/**
+ * The guidance line a command line produces, or `undefined` when it has none.
+ *
+ * Every user-facing error is a problem and at most one action, so a test about
+ * the wording has to be able to read both halves.
+ */
+function hintFor(argv: readonly string[]): string | undefined {
+  try {
+    parseCliArgs(argv);
+  } catch (error) {
+    if (error instanceof CliError) {
+      return error.hint;
+    }
+
+    throw error;
+  }
+
+  throw new Error(`expected ${JSON.stringify(argv)} to be rejected`);
+}
+
 /** Parses a command line that is expected to ask for the proxy to start. */
 function parseRun(argv: readonly string[]) {
   const parsed = parseCliArgs(argv);
@@ -212,9 +232,13 @@ describe('parseCliArgs', () => {
   });
 
   // A separate `-1` would be read as another flag, so the parser asks for the
-  // unambiguous form rather than guessing.
-  it('asks for --latency=-1 when a negative value is given as its own argument', () => {
-    expect(() => parseCliArgs(['--target', TARGET, '--latency', '-1'])).toThrow(/--latency=-XYZ/);
+  // unambiguous form rather than guessing — in one line of the CLI's own,
+  // rather than in the three the parser offers.
+  it('asks for the --latency=<value> form when a negative value is given on its own', () => {
+    const argv = ['--target', TARGET, '--latency', '-1'];
+
+    expect(() => parseCliArgs(argv)).toThrow('Missing value for --latency.');
+    expect(hintFor(argv)).toBe('A value starting with "-" must be written as --latency=<value>.');
   });
 
   it('leaves a target that is not a URL to the proxy core', () => {
@@ -245,19 +269,173 @@ describe('parseCliArgs', () => {
 
   it('documents --seed in the help text', () => {
     expect(HELP_TEXT).toContain('--seed <value>');
-    expect(HELP_TEXT).toContain('Use deterministic chaos decisions for reproducible');
+    expect(HELP_TEXT).toContain('Deterministic chaos decisions');
   });
 });
 
 describe('HELP_TEXT connection resets', () => {
   it('documents --reset-rate and what it does', () => {
     expect(HELP_TEXT).toContain('--reset-rate <0-1>');
-    expect(HELP_TEXT).toContain('Probability of abruptly resetting the client');
+    expect(HELP_TEXT).toContain('Probability of abruptly resetting the connection');
   });
 
-  it('states where the reset decision sits in the chaos order', () => {
-    expect(HELP_TEXT).toContain('latency delay, then connection reset, then timeout, then error');
+  // Where the reset decision sits in the chaos order is documented in the
+  // README. Help lists the options; it is not the manual.
+  it('lists it among the chaos options rather than explaining the order', () => {
+    expect(HELP_TEXT).toContain('Chaos options:');
+    expect(HELP_TEXT).not.toContain('latency delay, then connection reset');
   });
+});
+
+describe('HELP_TEXT shape', () => {
+  it('opens with the tool and what it does', () => {
+    const lines = HELP_TEXT.split('\n');
+
+    expect(lines[0]).toBe('Chaos Proxy');
+    expect(HELP_TEXT).toContain('Inject latency, HTTP errors, timeouts and connection resets');
+  });
+
+  it.each([
+    'chaos-proxy --target <url> [options]',
+    'chaos-proxy --config <path> [options]',
+    'chaos-proxy [options]',
+  ])('offers the %j invocation', (usage) => {
+    expect(HELP_TEXT).toContain(usage);
+  });
+
+  it('says that ./chaos.yml is picked up on its own, where a beginner will see it', () => {
+    expect(HELP_TEXT).toContain('auto-loads ./chaos.yml when present');
+    expect(HELP_TEXT).toContain('A ./chaos.yml in the\ncurrent directory is loaded automatically');
+  });
+
+  it.each([
+    '--target <url>',
+    '--port <1-65535>',
+    '--config <path>',
+    '--preset <name>',
+    '--seed <value>',
+    '--print-config',
+    '--quiet',
+    '--latency <ms>',
+    '--error-rate <0-1>',
+    '--error-status <400-599>',
+    '--timeout-rate <0-1>',
+    '--timeout <ms>',
+    '--reset-rate <0-1>',
+    '-h, --help',
+    '-v, --version',
+  ])('documents %s', (option) => {
+    expect(HELP_TEXT).toContain(option);
+  });
+
+  it('groups the options by what a reader is choosing between', () => {
+    expect(HELP_TEXT).toContain('Core options:');
+    expect(HELP_TEXT).toContain('Chaos options:');
+    expect(HELP_TEXT).toContain('Presets:');
+    expect(HELP_TEXT).toContain('Other:');
+  });
+
+  it.each(['slow-api', 'flaky-api', 'timeout-heavy', 'backend-down'])(
+    'lists the %s preset',
+    (name) => {
+      expect(HELP_TEXT).toContain(name);
+    },
+  );
+
+  it('shows short examples that can be typed as they stand', () => {
+    expect(HELP_TEXT).toContain('Examples:');
+    expect(HELP_TEXT).toContain('chaos-proxy --target http://localhost:3000\n');
+    expect(HELP_TEXT).toContain('chaos-proxy --target http://localhost:3000 --preset flaky-api');
+    expect(HELP_TEXT).toContain('--error-rate 0.2 --seed test-run');
+    expect(HELP_TEXT).toContain('chaos-proxy --print-config');
+    // A continuation is a shell detail, and pasted into the wrong one it breaks.
+    expect(HELP_TEXT).not.toContain('\\\n');
+  });
+
+  // Help someone scrolls is help someone stops reading. The numbers are room to
+  // work in, not a target: they only fail a help text that has become a manual.
+  it('stays short enough to read in one screenful or two', () => {
+    const lines = HELP_TEXT.split('\n');
+
+    expect(lines.length).toBeLessThanOrEqual(60);
+    expect(Math.max(...lines.map((line) => line.length))).toBeLessThanOrEqual(80);
+  });
+
+  // Alignment is done with spaces, so it survives a pipe, a log file and a
+  // terminal that knows nothing about escape sequences.
+  it('needs no colour to be readable', () => {
+    // eslint-disable-next-line no-control-regex
+    expect(HELP_TEXT).not.toMatch(/\u001B\[/);
+  });
+});
+
+describe('numeric flag errors', () => {
+  it.each([
+    [['--port', '0'], 'Invalid --port "0".', 'Expected an integer between 1 and 65535.'],
+    [['--port', 'abc'], 'Invalid --port "abc".', 'Expected an integer between 1 and 65535.'],
+    [['--latency', 'abc'], 'Invalid --latency "abc".', 'Expected a number.'],
+    [['--error-rate', 'abc'], 'Invalid --error-rate "abc".', 'Expected a number.'],
+    [['--timeout', 'soon'], 'Invalid --timeout "soon".', 'Expected a number.'],
+    [['--reset-rate', 'often'], 'Invalid --reset-rate "often".', 'Expected a number.'],
+  ])('reports %j as a problem and one expectation', (args, problem, hint) => {
+    const argv = ['--target', TARGET, ...args];
+
+    expect(() => parseCliArgs(argv)).toThrow(problem);
+    expect(hintFor(argv)).toBe(hint);
+  });
+
+  // Text that is not a number and a number out of range are the same mistake to
+  // the reader, so they are answered with the same sentence.
+  it('tells a --port of any shape what a port is', () => {
+    for (const port of ['0', '65536', '4000.5', 'abc', '']) {
+      expect(hintFor(['--target', TARGET, '--port', port])).toBe(
+        'Expected an integer between 1 and 65535.',
+      );
+    }
+  });
+});
+
+describe('parse errors', () => {
+  it.each([
+    [['--erro-rate', '0.5'], 'Unknown option --erro-rate.'],
+    [['--erro-rate=0.5'], 'Unknown option --erro-rate.'],
+    [['-x'], 'Unknown option -x.'],
+    [['--target'], 'Missing value for --target.'],
+  ])("reports %j in the CLI's own voice", (argv, message) => {
+    expect(() => parseCliArgs(argv)).toThrow(CliError);
+    expect(() => parseCliArgs(argv)).toThrow(message);
+  });
+
+  it('points an unknown option at the help', () => {
+    expect(hintFor(['--erro-rate', '0.5'])).toBe('Run `chaos-proxy --help` for usage.');
+  });
+
+  it('names a positional argument and says the CLI takes none', () => {
+    expect(() => parseCliArgs([TARGET])).toThrow('Unexpected argument "http://localhost:3000".');
+    expect(hintFor([TARGET])).toContain('takes options only');
+  });
+
+  // Node words these for a library's caller: quoted flags, no full stops, and
+  // three lines of advice about dashes. None of that should reach a terminal.
+  it.each([['--erro-rate', '0.5'], ['--target'], ['--latency', '-1'], [TARGET]])(
+    'leaves no parser wording in %j',
+    (...argv) => {
+      let thrown: unknown;
+
+      try {
+        parseCliArgs(argv);
+      } catch (error) {
+        thrown = error;
+      }
+
+      const message = thrown instanceof Error ? thrown.message : String(thrown);
+
+      expect(message).not.toContain('\n');
+      expect(message).not.toContain("'");
+      expect(message.endsWith('.')).toBe(true);
+      expect(message).not.toContain('    at ');
+    },
+  );
 });
 
 describe('inFlagTerms', () => {
@@ -322,8 +500,9 @@ describe('parseCliArgs --preset', () => {
     const argv = ['--target', TARGET, '--preset', 'terrible-network'];
 
     expect(() => parseCliArgs(argv)).toThrow(CliError);
-    expect(() => parseCliArgs(argv)).toThrow(
-      'Unknown preset "terrible-network". Available presets: slow-api, flaky-api, timeout-heavy, backend-down.',
+    expect(() => parseCliArgs(argv)).toThrow('Unknown preset "terrible-network".');
+    expect(hintFor(argv)).toBe(
+      'Available presets: slow-api, flaky-api, timeout-heavy, backend-down.',
     );
   });
 
@@ -344,9 +523,9 @@ describe('HELP_TEXT presets', () => {
     },
   );
 
-  it('states where a preset sits in the precedence order', () => {
+  it('says that a typed flag still beats a preset', () => {
     expect(HELP_TEXT).toContain(
-      'explicit chaos flags  >  --preset  >  config file  >  built-in defaults',
+      'A preset is a starting point, so an explicit chaos flag still wins',
     );
   });
 });

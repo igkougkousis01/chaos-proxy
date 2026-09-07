@@ -354,7 +354,7 @@ describe('config discovery through resolution', () => {
   it('still asks for a target when neither a flag nor a discovered file has one', () => {
     standIn(makeTempDir());
 
-    expect(() => resolve([])).toThrow('Missing required option --target');
+    expect(() => resolve([])).toThrow('Missing required target.');
   });
 
   it('names the discovered file when it is the one missing a target', () => {

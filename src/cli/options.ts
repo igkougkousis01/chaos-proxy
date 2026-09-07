@@ -31,9 +31,20 @@ export const DISPLAY_NAME = 'Chaos Proxy';
  * message on its own and exits non-zero instead of letting a stack trace out.
  */
 export class CliError extends Error {
-  constructor(message: string) {
+  /**
+   * One line of guidance printed beneath the problem, or `undefined` when the
+   * problem says everything there is to say.
+   *
+   * Kept apart from the message so that every user-facing error has the same
+   * shape — a concise problem, then at most one action — without each thrower
+   * having to decide how the two are punctuated together.
+   */
+  readonly hint: string | undefined;
+
+  constructor(message: string, hint?: string) {
     super(message);
     this.name = 'CliError';
+    this.hint = hint;
   }
 }
 
@@ -88,87 +99,125 @@ export type ParsedCli =
   | { readonly kind: 'help' }
   | { readonly kind: 'version' };
 
-/** Text printed by `--help`. */
-export const HELP_TEXT = `${DISPLAY_NAME} — a local proxy that deliberately degrades traffic to an API,
-so you can test how an application handles latency, errors and timeouts.
+/**
+ * Text printed by `--help`.
+ *
+ * A map of the command line rather than its documentation: what the tool is,
+ * how it is invoked, every option once, the presets, and a few examples. The
+ * prose that used to live here — the chaos ordering, what a log line looks
+ * like, how the layers of configuration settle — is in the README, because help
+ * someone has to read twice answers nothing the first time.
+ *
+ * Options are grouped into the ones that decide how the proxy runs and the ones
+ * that decide how it misbehaves, which is the distinction a reader is actually
+ * making while scanning. Plain text throughout: no colour, so it reads the same
+ * in a pipe, a log and a terminal.
+ */
+export const HELP_TEXT = `${DISPLAY_NAME}
+
+Inject latency, HTTP errors, timeouts and connection resets into local API
+traffic, so you can test how an application copes with a misbehaving API.
 
 Usage:
   ${CLI_NAME} --target <url> [options]
   ${CLI_NAME} --config <path> [options]
+  ${CLI_NAME} [options]              # auto-loads ./chaos.yml when present
 
-Options:
-  --target <url>            API to forward to (http: or https:). Required
-                            unless the config file supplies it.
-  --config <path>           YAML config file with defaults and endpoint rules.
-                            Default: ./chaos.yml, when that file exists.
-  --preset <name>           Use a built-in chaos preset. See Presets below.
-  --port <1-65535>          Port to listen on. Default: ${DEFAULT_PORT}.
-  --latency <ms>            Fixed delay added to every request.
-  --error-rate <0-1>        Fraction of requests answered with a synthetic error.
-  --error-status <400-599>  Status code used by injected errors. Default: 500.
-  --timeout-rate <0-1>      Fraction of requests held open and then timed out.
-  --timeout <ms>            How long a timed-out request is held. Default: 30000.
-  --reset-rate <0-1>        Probability of abruptly resetting the client
-                            connection, with no HTTP response at all.
-  --seed <value>            Use deterministic chaos decisions for reproducible
-                            test runs.
-  --quiet                   Print nothing but errors, which still go to stderr.
-  --print-config            Print the resolved configuration and exit, without
-                            starting the proxy.
-  -h, --help                Show this help.
-  -v, --version             Show the version.
+Core options:
+  --target <url>            API to forward to (http: or https:)
+  --port <1-65535>          Port to listen on, on ${LISTEN_HOST}. Default: ${DEFAULT_PORT}
+  --config <path>           YAML config file with defaults and endpoint rules
+  --preset <name>           Built-in chaos preset. See Presets below
+  --seed <value>            Deterministic chaos decisions, reproducible runs
+  --print-config            Print the resolved configuration and exit
+  --quiet                   Suppress informational output; errors still print
 
-The proxy listens on ${LISTEN_HOST} only, so it is never exposed to the network.
-Each request receives at most one injected outcome, decided in this order:
-latency delay, then connection reset, then timeout, then error, then forwarding
-upstream. A reset request is never contacted upstream and receives no status.
-
-With --seed those decisions come from a seeded generator instead: the same seed,
-the same settings and the same order of requests replay the same outcomes.
-
-Every completed request prints one line, unless --quiet is given:
-
-  12:41:03 GET    /api/users -> 200 42ms forwarded
-  12:41:07 POST   /api/payments/123 -> 503 510ms injected:error latency:+500ms
-  12:41:11 GET    /api/cart -> RESET 12ms connection:reset
-
-A config file adds per-endpoint rules; the first rule whose "match" fits the
-request path wins. ./chaos.yml in the current directory is loaded automatically
-when --config is not given; an explicit --config always wins over it, and fails
-rather than falling back if the file it names is not there.
-
---print-config settles everything — flags, preset, config file, defaults — and
-prints the configuration the proxy would run with, then exits without listening
-on anything. --quiet does not suppress it.
+Chaos options:
+  --latency <ms>            Fixed delay added to every request
+  --error-rate <0-1>        Fraction of requests answered with a synthetic error
+  --error-status <400-599>  Status code used by injected errors. Default: 500
+  --timeout-rate <0-1>      Fraction of requests held open and then timed out
+  --timeout <ms>            How long a timed-out request is held. Default: 30000
+  --reset-rate <0-1>        Probability of abruptly resetting the connection
 
 Presets:
 ${PRESET_HELP}
 
-A preset is a starting point rather than a mode, so precedence runs:
+  A preset is a starting point, so an explicit chaos flag still wins over it.
 
-  explicit chaos flags  >  --preset  >  config file  >  built-in defaults
+Other:
+  -h, --help                Show this help
+  -v, --version             Show the version
 
 Examples:
   ${CLI_NAME} --target http://localhost:3000
-
-  ${CLI_NAME} \\
-    --target http://localhost:3000 \\
-    --latency 500 \\
-    --error-rate 0.2
-
-  ${CLI_NAME} \\
-    --target http://localhost:3000 \\
-    --error-rate 0.5 \\
-    --seed checkout-test
-
   ${CLI_NAME} --target http://localhost:3000 --preset flaky-api
+  ${CLI_NAME} --target http://localhost:3000 --error-rate 0.2 --seed test-run
+  ${CLI_NAME} --print-config
 
-  ${CLI_NAME} --config chaos.yml
+--target is required unless a config file supplies it. A ./chaos.yml in the
+current directory is loaded automatically; --config overrides it.`;
 
-  ${CLI_NAME} --preset flaky-api --error-rate 0.5 --print-config`;
-
-/** Pointer appended to usage errors, so the user knows where to look. */
+/**
+ * Pointer added to a mistake in what was typed, so the user knows where to look.
+ *
+ * Only to those. A config file that will not load, a target the core rejects and
+ * a port that is taken each come with guidance of their own, and appending this
+ * to them as well would be a line that is always there and never the answer.
+ */
 export const USAGE_HINT = `Run \`${CLI_NAME} --help\` for usage.`;
+
+/**
+ * `parseArgs` complaints, in the CLI's own voice.
+ *
+ * Node words these for a JavaScript audience: single-quoted flags, no full
+ * stops, and — for a value that starts with a dash — three lines of advice
+ * about how to write it. Every other error this tool produces is one problem
+ * sentence and at most one action, so these are rewritten to match rather than
+ * left as the one place the CLI sounds like a library.
+ *
+ * Anything unrecognised keeps its first line, which is the problem itself; the
+ * lines beneath it are the parser explaining itself and are dropped. A wording
+ * Node changes therefore still reads as an ordinary error rather than breaking.
+ */
+export function describeParseError(message: string): CliError {
+  const first = (message.split('\n')[0] ?? message).trim();
+
+  const unknown = /^Unknown option '(-[^']*)'/.exec(first);
+
+  if (unknown !== null) {
+    return new CliError(`Unknown option ${unknown[1]}.`, USAGE_HINT);
+  }
+
+  const missing = /^Option '(--[^' ]+)[^']*' argument missing/.exec(first);
+
+  if (missing !== null) {
+    return new CliError(`Missing value for ${missing[1]}.`, USAGE_HINT);
+  }
+
+  // `--latency -1` reads as two flags, so the parser cannot tell a value from
+  // the next option. The `=` form is the whole answer, and is worth more here
+  // than a pointer to the help.
+  const ambiguous = /^Option '(--[^']+)' argument is ambiguous/.exec(first);
+
+  if (ambiguous !== null) {
+    return new CliError(
+      `Missing value for ${ambiguous[1]}.`,
+      `A value starting with "-" must be written as ${ambiguous[1]}=<value>.`,
+    );
+  }
+
+  const positional = /^Unexpected argument '([^']*)'/.exec(first);
+
+  if (positional !== null) {
+    return new CliError(
+      `Unexpected argument ${JSON.stringify(positional[1])}.`,
+      `${CLI_NAME} takes options only. ${USAGE_HINT}`,
+    );
+  }
+
+  return new CliError(first.endsWith('.') ? first : `${first}.`, USAGE_HINT);
+}
 
 /**
  * `createProxyServer` option names, mapped to the flag that carries each one.
@@ -205,6 +254,35 @@ export function inFlagTerms(message: string): string {
 }
 
 /**
+ * A value the proxy core rejected, as a usage error the reader can scan.
+ *
+ * The core words its complaints as one sentence — `Invalid errorRate 5:
+ * expected a number between 0 and 1 inclusive.` — which carries both the
+ * problem and the expectation. Splitting them puts each user-facing error into
+ * the same shape as every other: what is wrong, then what was wanted. The core
+ * stays the single authority on the ranges themselves; this only decides where
+ * the line breaks.
+ *
+ * A message worded some other way has no expectation to lift out and is used
+ * whole, which reads longer but never wrong.
+ */
+export function usageErrorFrom(message: string): CliError {
+  const inTerms = inFlagTerms(message);
+  const at = inTerms.indexOf(': expected ');
+
+  if (at === -1) {
+    return new CliError(inTerms);
+  }
+
+  const expectation = inTerms.slice(at + ': expected '.length);
+
+  return new CliError(
+    `${inTerms.slice(0, at)}.`,
+    `Expected ${expectation.charAt(0).toLowerCase()}${expectation.slice(1)}`,
+  );
+}
+
+/**
  * Reads a flag value as a number.
  *
  * This is the only numeric checking the CLI does for chaos options: it turns
@@ -218,7 +296,7 @@ function toNumber(flag: string, raw: string): number {
   const value = raw.trim() === '' ? Number.NaN : Number(raw);
 
   if (Number.isNaN(value)) {
-    throw new CliError(`Invalid --${flag} ${JSON.stringify(raw)}: expected a number.`);
+    throw new CliError(`Invalid --${flag} ${JSON.stringify(raw)}.`, 'Expected a number.');
   }
 
   return value;
@@ -235,11 +313,16 @@ function toNumber(flag: string, raw: string): number {
  * @throws {CliError} If the value is not an integer from 1 to 65535.
  */
 function toPort(raw: string): number {
-  const value = toNumber('port', raw);
+  const value = raw.trim() === '' ? Number.NaN : Number(raw);
 
+  // Text that is not a number and a number outside the range are the same
+  // mistake to the reader — the port they typed is not one — so both are told
+  // what a port is, rather than one of them being told only that it is not a
+  // number.
   if (!isValidPort(value)) {
     throw new CliError(
-      `Invalid --port ${JSON.stringify(raw)}: expected an integer between ${PORT_MIN} and ${PORT_MAX}.`,
+      `Invalid --port ${JSON.stringify(raw)}.`,
+      `Expected an integer between ${PORT_MIN} and ${PORT_MAX}.`,
     );
   }
 
@@ -257,7 +340,10 @@ function toPort(raw: string): number {
  */
 function toPreset(raw: string): PresetName {
   if (!isPresetName(raw)) {
-    throw new CliError(`Unknown preset ${JSON.stringify(raw)}. Available presets: ${PRESET_LIST}.`);
+    throw new CliError(
+      `Unknown preset ${JSON.stringify(raw)}.`,
+      `Available presets: ${PRESET_LIST}.`,
+    );
   }
 
   return raw;
@@ -304,7 +390,7 @@ export function parseCliArgs(argv: readonly string[]): ParsedCli {
       },
     }));
   } catch (error) {
-    throw new CliError(error instanceof Error ? error.message : String(error));
+    throw describeParseError(error instanceof Error ? error.message : String(error));
   }
 
   if (values.help === true) {
@@ -318,14 +404,15 @@ export function parseCliArgs(argv: readonly string[]): ParsedCli {
   const configPath = values.config;
 
   if (configPath !== undefined && (typeof configPath !== 'string' || configPath === '')) {
-    throw new CliError('Invalid --config: expected a path, for example --config chaos.yml.');
+    throw new CliError('Invalid --config "".', 'Expected a path, for example chaos.yml.');
   }
 
   const target = values.target;
 
   if (target !== undefined && (typeof target !== 'string' || target === '')) {
     throw new CliError(
-      'Invalid --target: expected a URL, for example --target http://localhost:3000.',
+      'Invalid --target "".',
+      'Expected a URL, for example http://localhost:3000.',
     );
   }
 
@@ -342,14 +429,15 @@ export function parseCliArgs(argv: readonly string[]): ParsedCli {
   // string in a script is the string the sequence comes from.
   if (seed !== undefined && (typeof seed !== 'string' || seed === '')) {
     throw new CliError(
-      'Invalid --seed: expected a non-empty value, for example --seed checkout-test.',
+      'Invalid --seed "".',
+      'Expected a non-empty value, for example checkout-test.',
     );
   }
 
   const preset = values.preset;
 
   if (preset !== undefined && typeof preset !== 'string') {
-    throw new CliError(`Invalid --preset: expected one of ${PRESET_LIST}.`);
+    throw new CliError('Invalid --preset.', `Expected one of ${PRESET_LIST}.`);
   }
 
   const latencyMs = optionalNumber(values.latency, 'latency');

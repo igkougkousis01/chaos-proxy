@@ -155,9 +155,9 @@ are no `--init`, `--write-config` or `--migrate-config` commands to go with it. 
 suppress it, because `--quiet` silences what the CLI volunteers rather than what it was asked for.
 
 The startup summary reports `Connection resets: <rate>` when the settled global rate is above zero,
-and says nothing when it is not — the same rule the other chaos lines follow. Like them it
-describes what applies to a request no rule matches; per-rule rates stay in the file rather than
-being reprinted as a summary of their own.
+and says nothing when it is not — the same rule every chaos line follows. Like them it describes
+what applies to a request no rule matches; per-rule rates stay in the file rather than being
+reprinted as a summary of their own.
 
 `src/presets/index.ts` is the whole of the preset feature: a frozen table of four named blocks of
 chaos options — `slow-api`, `flaky-api`, `timeout-heavy` and `backend-down` — plus the summaries
@@ -188,9 +188,41 @@ preset in use on its own line; the chaos lines below it are read off the settled
 The proxy binds to `127.0.0.1` only, and that is deliberately not configurable: a tool whose
 purpose is to break traffic should never be reachable from the LAN by accident. `SIGINT` and
 `SIGTERM` stop it by closing the listener and releasing idle keep-alive sockets, letting requests
-in flight finish rather than cutting them off. Usage mistakes, options the core rejects, and a
-port that is already in use are all reported as a single readable line and a non-zero exit code,
-without a stack trace; unexpected errors are still allowed to surface normally.
+in flight finish rather than cutting them off. `Press Ctrl+C to stop.` closes the startup summary,
+so how to stop it is on screen rather than assumed.
+
+`--help` is a map of the command line rather than its documentation: the tool and what it does,
+three invocations — including the bare one that picks up `./chaos.yml` — then the options in two
+groups, the presets, and four examples short enough to type. The prose it used to carry about
+chaos ordering, log-line shapes and precedence is in the README, where a reader who wants it can
+find it and a reader who does not is not scrolling past it. It is plain text with no colour, so it
+reads the same in a terminal, a pipe and a log.
+
+The startup summary answers two questions in order: what this run is pointed at — target, config
+file, preset, seed — and what it will do to a request. Only lines that apply are printed. A chaos
+setting that is off is not mentioned, because a summary that reported `0%` would describe chaos
+that never happens, and `Rules:` appears only when the file contributed some, since `Rules: 0`
+reads as a file that failed to take effect. The chaos lines are read off the settled options and
+run in the order the flags are documented and `--print-config` prints them, so the three places a
+setting can be read all agree.
+
+Every user-facing failure has one shape: `chaos-proxy:` and a concise problem, then at most one
+line saying what to do about it, both on stderr with a non-zero exit code and no stack trace. One
+function writes them, which is what keeps the shape from drifting apart between a usage mistake, a
+value the proxy core rejected, an unusable config file and a port that would not bind. The pointer
+to `--help` is added only where the help would help — a mistyped flag, a stray argument — rather
+than after every failure, since a config file's contents and an occupied port are not things
+`--help` has anything to say about. `parseArgs` complaints are rewritten in the CLI's own voice
+for the same reason: Node words them for a library's caller, down to three lines of advice about
+values that start with a dash. Ranges are still the proxy core's to own — the split into problem
+and expectation is a line break, not a second copy of the rules — with `--port` the exception it
+already was, so text that is not a number and a number out of range are answered with the same
+sentence.
+
+stdout carries what was asked for and what the run is doing: help, the version, the startup
+summary, request lines, `--print-config`, and the shutdown notice. stderr carries only what went
+wrong. Nothing crosses over, so `chaos-proxy --print-config > run.yml` writes configuration and
+nothing else, and a request log is never mistaken for a diagnostic.
 
 `src/proxy/` implements the forwarding layer: `createProxyServer({ target })` returns a Node.js
 `http.Server` that streams requests through to an `http:` or `https:` target and streams the
@@ -333,10 +365,11 @@ The config layer translates all of that into effective proxy options; the proxy 
 about YAML, files, or rules.
 
 On the command line, request logging is on by default and `--quiet` turns it off, along with the
-startup summary and the shutdown notice — everything the CLI volunteers rather than everything it
-has to say, so errors still reach stderr and `--help` and `--version` still print. It is a flag
-only: the config file has no `logging` section, because a per-run choice about terminal noise does
-not belong in a file describing how an API should misbehave.
+startup summary, the stop hint and the shutdown notice — everything the CLI volunteers rather than
+everything it has to say, so errors still reach stderr and `--help`, `--version` and
+`--print-config` still print. It is a flag only: the config file has no `logging` section, because
+a per-run choice about terminal noise does not belong in a file describing how an API should
+misbehave.
 
 Randomised or ranged delays and timeout durations, choosing between multiple or weighted error
 statuses, and method- or host-specific rules do not exist yet. Nor do the connection failures this
@@ -344,7 +377,8 @@ one is not: refusing connections outright, resetting part-way through a request 
 half-open sockets, configurable or per-rule reset timing, packet loss, bandwidth throttling, and
 upstream-side connection failures after forwarding has begun. Neither do
 structured or JSON logs, log files, log levels, request IDs, tracing, metrics, or naming the rule
-that matched in a log line; nor JSON or TOML config, environment variables or `${VAR}`
+that matched in a log line; nor colours, themes, shell completion, interactive prompts, a config
+wizard or any other terminal machinery — the output is plain text a pipe can read; nor JSON or TOML config, environment variables or `${VAR}`
 interpolation, remote or URL config, multiple config files, includes, inheritance, hot reload, file
 watching, or merging several matching rules. Config discovery is deliberately the narrowest rule
 that is useful: `./chaos.yml` and nothing else — no `chaos.yaml`, no `.chaos.yml`, no

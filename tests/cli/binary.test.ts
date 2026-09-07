@@ -12,6 +12,8 @@ import { promisify } from 'node:util';
 import { parse as parseYaml } from 'yaml';
 import { afterEach, beforeAll, describe, expect, it } from 'vitest';
 
+import { STOP_HINT } from '../../src/cli/program.js';
+
 /**
  * These tests drive the compiled `dist/cli.js` as a real child process, so they
  * cover the parts that only exist outside the module: the shebang, the `bin`
@@ -272,13 +274,14 @@ async function occupyPort(): Promise<number> {
  * Starts the CLI against `target` on a free port and waits until `readyText`
  * has been printed.
  *
- * Startup lines can arrive in separate chunks, so callers wait for the last
- * line they care about rather than for the first one.
+ * Startup lines can arrive in separate chunks, so readiness defaults to the
+ * stop hint: it is the last line of every summary, and a caller that has seen
+ * it can assert on any line above it without racing the next chunk.
  */
 async function startProxyCli(
   target: string,
   chaosArgs: readonly string[] = [],
-  readyText = `Target: ${target}`,
+  readyText: string | RegExp = STOP_HINT,
 ): Promise<{ cli: CliProcess; baseUrl: string }> {
   const port = await findFreePort();
   const cli = startCli(['--target', target, '--port', String(port), ...chaosArgs]);
@@ -419,7 +422,8 @@ describe('the built CLI', () => {
     const { code } = await cli.exit;
 
     expect(code).toBe(1);
-    expect(cli.stderr()).toContain(`port ${port} is already in use`);
+    expect(cli.stderr()).toContain(`Port ${port} is already in use`);
+    expect(cli.stderr()).toContain('Choose another port with --port.');
     // An expected user error, not a crash.
     expect(cli.stderr()).not.toContain('at ');
   }, 20_000);
@@ -483,6 +487,170 @@ describe('the built CLI', () => {
     await expect(response.text()).resolves.toBe('Chaos Proxy injected error');
     expect(upstream.requests).toHaveLength(0);
   }, 30_000);
+});
+
+describe('the built CLI help', () => {
+  it('opens with what the tool is and how it is invoked', async () => {
+    const cli = startCli(['--help']);
+
+    await expect(cli.exit).resolves.toMatchObject({ code: 0 });
+
+    const help = cli.stdout();
+
+    expect(help.split('\n')[0]).toBe('Chaos Proxy');
+    expect(help).toContain('Inject latency, HTTP errors, timeouts and connection resets');
+    expect(help).toContain('chaos-proxy --target <url> [options]');
+    expect(help).toContain('chaos-proxy --config <path> [options]');
+    expect(cli.stderr()).toBe('');
+  }, 20_000);
+
+  it('offers every chaos flag and every preset', async () => {
+    const cli = startCli(['--help']);
+
+    await expect(cli.exit).resolves.toMatchObject({ code: 0 });
+
+    const help = cli.stdout();
+
+    for (const flag of [
+      '--latency <ms>',
+      '--error-rate <0-1>',
+      '--error-status <400-599>',
+      '--timeout-rate <0-1>',
+      '--timeout <ms>',
+      '--reset-rate <0-1>',
+    ]) {
+      expect(help).toContain(flag);
+    }
+
+    for (const preset of ['slow-api', 'flaky-api', 'timeout-heavy', 'backend-down']) {
+      expect(help).toContain(preset);
+    }
+  }, 20_000);
+
+  // Someone who never opens the README has to learn this from help alone,
+  // otherwise a checked-in chaos.yml looks like chaos coming from nowhere.
+  it('says that ./chaos.yml is loaded on its own', async () => {
+    const cli = startCli(['--help']);
+
+    await expect(cli.exit).resolves.toMatchObject({ code: 0 });
+    expect(cli.stdout()).toContain('./chaos.yml');
+    expect(cli.stdout()).toContain('auto-loads ./chaos.yml when present');
+  }, 20_000);
+
+  it('shows examples, and stays short enough to read', async () => {
+    const cli = startCli(['--help']);
+
+    await expect(cli.exit).resolves.toMatchObject({ code: 0 });
+
+    const help = cli.stdout();
+
+    expect(help).toContain('Examples:');
+    expect(help).toContain('chaos-proxy --target http://localhost:3000 --preset flaky-api');
+    expect(help.trimEnd().split('\n').length).toBeLessThanOrEqual(60);
+  }, 20_000);
+});
+
+describe('the built CLI startup summary', () => {
+  it('reports the run and how to stop it, and nothing that is switched off', async () => {
+    const upstream = await startUpstream();
+    const { cli } = await startProxyCli(upstream.origin);
+
+    const lines = cli.stdout().trimEnd().split('\n');
+
+    expect(lines[0]).toMatch(/^Chaos Proxy listening on http:\/\/127\.0\.0\.1:\d+$/);
+    expect(lines[1]).toBe(`Target: ${upstream.origin}`);
+    expect(lines[2]).toBe(STOP_HINT);
+    expect(lines).toHaveLength(3);
+  }, 30_000);
+
+  it('exits cleanly on Ctrl+C, and says so once', async () => {
+    const upstream = await startUpstream();
+    const { cli } = await startProxyCli(upstream.origin);
+
+    cli.child.kill('SIGINT');
+
+    await expect(cli.exit).resolves.toMatchObject({ code: 0, signal: null });
+
+    const output = cli.stdout();
+
+    expect(output).toContain('Received SIGINT, shutting down Chaos Proxy.');
+    // The hint belongs to a proxy that is running, not to one that is stopping.
+    expect(output.split(STOP_HINT)).toHaveLength(2);
+    expect(output.indexOf(STOP_HINT)).toBeLessThan(output.indexOf('shutting down'));
+    expect(cli.stderr()).toBe('');
+  }, 30_000);
+
+  it('describes a run with a config file, a preset and a seed', async () => {
+    const upstream = await startUpstream();
+    const dir = makeTempDir();
+    writeConfigIn(
+      dir,
+      'chaos.yml',
+      `target: ${upstream.origin}\n\ndefaults:\n  latencyMs: 20\n\nrules:\n  - match: /api/*\n    errorRate: 0\n`,
+    );
+    const port = await findFreePort();
+    const cli = startCli(
+      ['--port', String(port), '--preset', 'flaky-api', '--seed', 'checkout-test'],
+      dir,
+    );
+
+    await waitForOutput(cli, STOP_HINT);
+
+    const lines = cli.stdout().trimEnd().split('\n');
+
+    expect(lines.slice(1)).toEqual([
+      `Target: ${upstream.origin}`,
+      `Config: ${join(realpathSync(dir), 'chaos.yml')}`,
+      'Preset: flaky-api',
+      'Seed: checkout-test',
+      'Latency: 20ms',
+      'Error injection: 25% -> 503',
+      'Rules: 1',
+      STOP_HINT,
+    ]);
+  }, 30_000);
+});
+
+describe('the built CLI errors', () => {
+  it('refuses an unknown option without a stack trace, and points at the help', async () => {
+    const cli = startCli(['--erro-rate', '0.5']);
+
+    const { code } = await cli.exit;
+
+    expect(code).toBe(1);
+    expect(cli.stdout()).toBe('');
+    expect(cli.stderr().trimEnd().split('\n')).toEqual([
+      'chaos-proxy: Unknown option --erro-rate.',
+      'Run `chaos-proxy --help` for usage.',
+    ]);
+    expect(cli.stderr()).not.toContain('    at ');
+  }, 20_000);
+
+  it('refuses a numeric value out of range, saying what was expected', async () => {
+    const cli = startCli(['--target', 'http://127.0.0.1:1', '--error-rate', '2']);
+
+    const { code } = await cli.exit;
+
+    expect(code).toBe(1);
+    expect(cli.stdout()).toBe('');
+    expect(cli.stderr().trimEnd().split('\n')).toEqual([
+      'chaos-proxy: Invalid --error-rate 2.',
+      'Expected a number between 0 and 1 inclusive.',
+    ]);
+    expect(cli.stderr()).not.toContain('    at ');
+  }, 20_000);
+
+  it('says what to provide when nothing supplies a target', async () => {
+    const cli = startCli([], makeTempDir());
+
+    const { code } = await cli.exit;
+
+    expect(code).toBe(1);
+    expect(cli.stderr().trimEnd().split('\n')).toEqual([
+      'chaos-proxy: Missing required target.',
+      'Provide --target <url>, or set "target" in ./chaos.yml.',
+    ]);
+  }, 20_000);
 });
 
 describe('the built CLI request logging', () => {
@@ -556,7 +724,7 @@ describe('the built CLI request logging', () => {
     const { cli, baseUrl } = await startProxyCli(
       upstream.origin,
       ['--timeout-rate', '1', '--timeout', '50'],
-      'Timeout injection: 100% -> 50ms',
+      'Timeout injection: 100% after 50ms',
     );
 
     const response = await fetch(`${baseUrl}/api/search`);
@@ -614,7 +782,7 @@ describe('the built CLI with --quiet', () => {
 
     expect(code).toBe(1);
     expect(cli.stdout()).toBe('');
-    expect(cli.stderr()).toContain(`port ${port} is already in use`);
+    expect(cli.stderr()).toContain(`Port ${port} is already in use`);
   }, 20_000);
 
   it('still reports a usage mistake on stderr', async () => {
@@ -626,6 +794,29 @@ describe('the built CLI with --quiet', () => {
     expect(cli.stdout()).toBe('');
     expect(cli.stderr()).toContain('--target');
   }, 20_000);
+
+  it('prints no stop hint, since it prints no summary to end', async () => {
+    const upstream = await startUpstream();
+    const port = await findFreePort();
+    const cli = startCli(['--target', upstream.origin, '--port', String(port), '--quiet']);
+
+    await fetchWhenListening(`http://127.0.0.1:${port}/api/users`);
+    await sleep(200);
+
+    expect(cli.stdout()).not.toContain(STOP_HINT);
+  }, 30_000);
+
+  it.each([['--help'], ['--version']])(
+    'still prints %s',
+    async (flag) => {
+      const cli = startCli(['--quiet', flag]);
+
+      await expect(cli.exit).resolves.toMatchObject({ code: 0 });
+      expect(cli.stdout().trim()).not.toBe('');
+      expect(cli.stderr()).toBe('');
+    },
+    20_000,
+  );
 });
 
 describe('the built CLI with --config', () => {
@@ -815,7 +1006,7 @@ describe('the built CLI with --seed', () => {
 
     await expect(cli.exit).resolves.toMatchObject({ code: 0 });
     expect(cli.stdout()).toContain('--seed <value>');
-    expect(cli.stdout()).toContain('Use deterministic chaos decisions for reproducible');
+    expect(cli.stdout()).toContain('Deterministic chaos decisions');
   }, 20_000);
 
   it('announces the seed it was given', async () => {
@@ -937,7 +1128,10 @@ async function startPresetCli(
     preset,
     ...extraArgs,
   ]);
-  await waitForOutput(cli, `Preset: ${preset}`);
+  // The stop hint is the last line of the summary, so waiting for it means the
+  // whole summary has arrived and a test can assert on any line of it.
+  await waitForOutput(cli, STOP_HINT);
+  expect(cli.stdout()).toContain(`Preset: ${preset}`);
 
   return { cli, baseUrl: `http://127.0.0.1:${port}` };
 }
@@ -966,8 +1160,10 @@ describe('the built CLI with --preset', () => {
 
     expect(code).not.toBe(0);
     expect(cli.stdout()).toBe('');
-    expect(cli.stderr()).toContain('Unknown preset "terrible-network"');
-    expect(cli.stderr()).toContain('slow-api, flaky-api, timeout-heavy, backend-down');
+    expect(cli.stderr()).toContain('chaos-proxy: Unknown preset "terrible-network".');
+    expect(cli.stderr()).toContain(
+      'Available presets: slow-api, flaky-api, timeout-heavy, backend-down.',
+    );
     // An expected user mistake, not a crash.
     expect(cli.stderr()).not.toContain('at ');
   }, 20_000);
@@ -1127,7 +1323,7 @@ describe('the built CLI with --reset-rate', () => {
 
     await expect(cli.exit).resolves.toMatchObject({ code: 0 });
     expect(cli.stdout()).toContain('--reset-rate <0-1>');
-    expect(cli.stdout()).toContain('Probability of abruptly resetting the client');
+    expect(cli.stdout()).toContain('Probability of abruptly resetting the connection');
   }, 20_000);
 
   it('refuses a rate outside 0-1 and never listens', async () => {
