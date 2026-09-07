@@ -1,8 +1,8 @@
 import { readFileSync } from 'node:fs';
 import type { Server } from 'node:http';
 
+import { ConfigError } from '../config/schema.js';
 import { createProxyServer } from '../index.js';
-import type { ProxyServerOptions } from '../index.js';
 import {
   CLI_NAME,
   CliError,
@@ -13,7 +13,8 @@ import {
   inFlagTerms,
   parseCliArgs,
 } from './options.js';
-import type { CliCommand } from './options.js';
+import { resolveCommand } from './resolve.js';
+import type { ResolvedCommand } from './resolve.js';
 
 /** Where the CLI writes its output, so tests can capture it without a shell. */
 export interface CliIo {
@@ -69,10 +70,19 @@ function asPercentage(rate: number): string {
  * Only chaos that is actually switched on is mentioned, and only values the
  * user supplied are shown: the proxy core owns the defaults for `--error-status`
  * and `--timeout`, so repeating them here would be a second copy to keep in
- * step.
+ * step. The chaos shown is what applies to a request no rule matches; per-rule
+ * settings are left in the file rather than reprinted.
  */
-function startupLines(listeningOn: string, proxy: ProxyServerOptions): string[] {
+function startupLines(listeningOn: string, command: ResolvedCommand): string[] {
+  const { proxy } = command;
   const lines = [`${DISPLAY_NAME} listening on ${listeningOn}`, `Target: ${proxy.target}`];
+
+  // Named rather than summarised: which file is in effect is what someone
+  // debugging unexpected chaos needs, and the file itself is right there.
+  if (command.configPath !== undefined) {
+    lines.push(`Config: ${command.configPath}`);
+    lines.push(`Rules: ${command.ruleCount}`);
+  }
 
   if (proxy.latencyMs !== undefined && proxy.latencyMs > 0) {
     lines.push(`Latency: ${proxy.latencyMs}ms`);
@@ -111,7 +121,7 @@ function describeListenError(error: NodeJS.ErrnoException, port: number): string
  * Resolves with the exit code: `0` once the server has shut down cleanly, or
  * `1` if it never managed to listen.
  */
-function listen(server: Server, command: CliCommand, io: CliIo): Promise<number> {
+function listen(server: Server, command: ResolvedCommand, io: CliIo): Promise<number> {
   return new Promise<number>((resolve) => {
     function onStartupError(error: NodeJS.ErrnoException): void {
       io.err(`${CLI_NAME}: ${describeListenError(error, command.port)}`);
@@ -167,7 +177,7 @@ function listen(server: Server, command: CliCommand, io: CliIo): Promise<number>
           ? `http://${address.address}:${address.port}`
           : `http://${LISTEN_HOST}:${command.port}`;
 
-      for (const line of startupLines(listeningOn, command.proxy)) {
+      for (const line of startupLines(listeningOn, command)) {
         io.out(line);
       }
 
@@ -185,10 +195,10 @@ function listen(server: Server, command: CliCommand, io: CliIo): Promise<number>
 /**
  * Runs the CLI and resolves with the process exit code.
  *
- * Expected problems — a usage mistake, an option the proxy core rejects, or a
- * port that cannot be bound — are reported as a single line and a non-zero
- * code. Anything else is left to propagate, so a real defect still shows its
- * stack trace.
+ * Expected problems — a usage mistake, an unusable config file, an option the
+ * proxy core rejects, or a port that cannot be bound — are reported as a single
+ * line and a non-zero code. Anything else is left to propagate, so a real
+ * defect still shows its stack trace.
  */
 export async function runCli(argv: readonly string[], io: CliIo = consoleIo): Promise<number> {
   function reportUsageError(message: string): number {
@@ -198,7 +208,7 @@ export async function runCli(argv: readonly string[], io: CliIo = consoleIo): Pr
     return 1;
   }
 
-  let command: CliCommand;
+  let command: ResolvedCommand;
 
   try {
     const parsed = parseCliArgs(argv);
@@ -213,9 +223,9 @@ export async function runCli(argv: readonly string[], io: CliIo = consoleIo): Pr
       return 0;
     }
 
-    command = parsed.command;
+    command = resolveCommand(parsed.command);
   } catch (error) {
-    if (error instanceof CliError) {
+    if (error instanceof CliError || error instanceof ConfigError) {
       return reportUsageError(error.message);
     }
 

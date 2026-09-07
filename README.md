@@ -4,8 +4,8 @@ A local developer tool for testing how an application behaves when its API misbe
 
 > **Status: under development.** Chaos Proxy runs from the command line and can forward HTTP
 > traffic to a target API, inject a fixed artificial latency, inject synthetic HTTP errors, and
-> inject synthetic timeouts. Connection failures, per-endpoint rules, and configuration files do
-> not exist yet.
+> inject synthetic timeouts — globally, or per endpoint through a YAML config file. Connection
+> failures do not exist yet.
 
 Chaos Proxy sits between an application and an API and deliberately degrades that connection, so
 that loading states, retries, error handling, and timeout behaviour can be exercised locally.
@@ -81,6 +81,7 @@ never reachable from the rest of the network. That is deliberate and not configu
 | Option                     | Default    | Description                                                     |
 | -------------------------- | ---------- | --------------------------------------------------------------- |
 | `--target <url>`           | _required_ | API to forward to. Must be an absolute `http:` or `https:` URL. |
+| `--config <path>`          |            | YAML config file with defaults and endpoint rules.              |
 | `--port <1-65535>`         | `4000`     | Port to listen on, on `127.0.0.1`.                              |
 | `--latency <ms>`           | `0`        | Fixed delay added to every request.                             |
 | `--error-rate <0-1>`       | `0`        | Fraction of requests answered with a synthetic error.           |
@@ -89,6 +90,8 @@ never reachable from the rest of the network. That is deliberate and not configu
 | `--timeout <ms>`           | `30000`    | How long a timed-out request is held before it gets a `504`.    |
 | `-h`, `--help`             |            | Print usage and exit.                                           |
 | `-v`, `--version`          |            | Print the package version and exit.                             |
+
+`--target` is required unless the config file supplies it.
 
 Invalid values are rejected before the server starts, with a message naming the option — they are
 never silently clamped. A port that is already in use is reported as such rather than as a stack
@@ -116,6 +119,25 @@ and `https:` targets are both supported; anything else is rejected when the serv
 the target cannot be reached, the client receives `502 Bad Gateway`.
 
 The local proxy listener itself is plain HTTP.
+
+### Per-request chaos
+
+Chaos is the same for every request unless you pass a `resolveChaos` hook, which is called once
+per request and whose result is layered over the static options:
+
+```ts
+const server = createProxyServer({
+  target: 'http://localhost:5000',
+  latencyMs: 100,
+  resolveChaos: (request) =>
+    request.url?.startsWith('/api/payments/') === true ? { errorRate: 1, errorStatus: 503 } : {},
+});
+```
+
+Payments now fail, everything else is forwarded, and both still wait 100 ms — a field the hook
+leaves out keeps its static value. This is exactly how `--config` is implemented: the config layer
+turns `defaults` plus ordered rules into one such hook, so the proxy core never knows YAML exists.
+The hook is optional and purely additive; static options on their own work as they always have.
 
 ## Latency injection
 
@@ -169,8 +191,9 @@ Omitting `--error-rate` (or setting it to `0`) means requests are never failed. 
 `0`-`1`, `NaN`, and infinities are rejected when the server is created, as is an error status
 that is not an integer from `400` to `599`.
 
-Each request is decided independently. Choosing between several status codes, weighting them, and
-scoping errors to particular endpoints or methods are not supported.
+Each request is decided independently. Choosing between several status codes and weighting them
+are not supported. Scoping errors to particular endpoints is done with a
+[config file](#config-file); scoping them to particular methods is not supported.
 
 ## Timeout injection
 
@@ -223,8 +246,116 @@ Omitting `--timeout-rate` (or setting it to `0`) means requests are never timed 
 and infinite timeout durations. A timeout of `0` is accepted and means the `504` is sent on the
 next timer tick, without waiting.
 
-Random or ranged timeout durations, jitter, dropped or reset TCP connections, and per-endpoint
-timeouts are not supported.
+Random or ranged timeout durations, jitter, and dropped or reset TCP connections are not
+supported. Per-endpoint timeouts are configured with a [config file](#config-file).
+
+## Config file
+
+Different routes usually need different failure behaviour: payments should fail, search should
+stall, everything else should just be slow. Put that in a YAML file and pass it with `--config`.
+
+```yaml
+# chaos.yml
+target: http://localhost:3000
+
+defaults:
+  latencyMs: 100
+
+rules:
+  - match: /api/payments/*
+    errorRate: 1
+    errorStatus: 503
+```
+
+```bash
+chaos-proxy --config chaos.yml
+```
+
+```text
+Chaos Proxy listening on http://127.0.0.1:4000
+Target: http://localhost:3000
+Config: /home/you/project/chaos.yml
+Rules: 1
+Latency: 100ms
+```
+
+Every request is now delayed by 100 ms, and anything under `/api/payments/` fails with `503`
+instead of being forwarded. A relative path is resolved against the directory you run the command
+from. There is no auto-discovery: a config file is used only when `--config` names it.
+
+[`examples/chaos.yml`](examples/chaos.yml) is a complete file to copy.
+
+### Schema
+
+| Field      | Type   | Description                                                |
+| ---------- | ------ | ---------------------------------------------------------- |
+| `target`   | string | API to forward to. Required unless `--target` supplies it. |
+| `port`     | number | Port to listen on, `1`-`65535`. Same meaning as `--port`.  |
+| `defaults` | map    | Chaos applied to every request. Same fields as the flags.  |
+| `rules`    | list   | Endpoint rules, tried in order. Each needs a `match`.      |
+
+`defaults` and each rule accept the chaos settings `latencyMs`, `errorRate`, `errorStatus`,
+`timeoutRate` and `timeoutMs` — the same names, meanings and ranges as the `createProxyServer`
+options below, validated by the same code. Any other field, at any level, is a mistake and is
+reported as one rather than being ignored:
+
+```text
+chaos-proxy: Invalid config: unknown field "errorate" in rules[0].
+```
+
+### Matching
+
+A rule's `match` is a path, and matching deliberately supports exactly two forms:
+
+| Pattern           | Matches                                                    | Does not match                           |
+| ----------------- | ---------------------------------------------------------- | ---------------------------------------- |
+| `/api/search`     | `/api/search`, `/api/search?q=test`                        | `/api/search/advanced`, `/api/searching` |
+| `/api/payments/*` | `/api/payments/`, `/api/payments/123`, `/api/payments/a/b` | `/api/payments`                          |
+
+Rules match on the request **path only**, so a query string never affects which rule is chosen.
+Patterns must start with `/`, and `*` is allowed only as a trailing `/*`. Regular expressions,
+`**`, a `*` in the middle, and matching on method, host or query string are not supported;
+`/api/*/details` is rejected when the file is read, not quietly ignored.
+
+### Rule precedence
+
+**The first matching rule wins.** Rules are never combined and never scored against each other,
+so a file can be read from top to bottom:
+
+```yaml
+rules:
+  - match: /api/*
+    errorRate: 0.1
+
+  - match: /api/payments/*
+    errorRate: 1
+```
+
+`/api/payments/123` matches `/api/*` first, so it gets `errorRate: 0.1` — the second rule never
+runs. Put the specific rules above the general ones.
+
+A matching rule overrides only the fields it actually names; everything else keeps its value from
+`defaults`. With the file above plus `defaults: { latencyMs: 100, errorStatus: 500 }`, a request
+to `/api/payments/123` ends up with `latencyMs: 100`, `errorRate: 0.1` and `errorStatus: 500`.
+
+### Precedence overall
+
+```text
+command-line flags  >  config file  >  built-in defaults
+```
+
+A flag you type wins over the config file, and that includes rules:
+
+```bash
+chaos-proxy --config chaos.yml --port 5000 --error-rate 0
+```
+
+`--port 5000` overrides the file's `port`, and `--error-rate 0` switches error injection off
+everywhere — including inside a rule that sets `errorRate: 1`. The reasoning is that a flag typed
+on the spot is the more deliberate of the two.
+
+Configuration is `--config` only. Environment variables, `.chaosrc`-style auto-discovery, JSON
+config, hot reload, and config includes are not supported.
 
 ## Development
 
@@ -260,7 +391,7 @@ npm run dev -- --target http://localhost:3000 --latency 500
 | Latency injection   | Fixed delay                       |
 | Error injection     | Fixed status, fixed probability   |
 | Timeout injection   | Fixed duration, fixed probability |
-| Config files        | Not started                       |
+| Config files        | YAML, with endpoint rules         |
 | Other chaos         | Not started                       |
 
 ## License

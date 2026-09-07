@@ -1,0 +1,23 @@
+# Chaos Proxy config: chaos-proxy --config examples/chaos.yml
+#
+# Every request is slowed by 100ms. Payments always fail with 503, and search
+# always stalls for 2s. The first rule whose "match" fits the request path wins,
+# and any flag on the command line beats everything here.
+
+target: http://localhost:3000
+
+port: 4000
+
+defaults:
+  latencyMs: 100
+
+rules:
+  # Exact path: matches /api/search, but not /api/search/advanced.
+  - match: /api/search
+    timeoutRate: 1
+    timeoutMs: 2000
+
+  # Trailing wildcard: matches /api/payments/ and anything below it.
+  - match: /api/payments/*
+    errorRate: 1
+    errorStatus: 503

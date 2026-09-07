@@ -1,8 +1,9 @@
 import { parseArgs } from 'node:util';
 
-import type { ProxyServerOptions } from '../proxy/server.js';
+import { PORT_MAX, PORT_MIN, isValidPort } from '../config/schema.js';
+import type { ChaosOptions } from '../proxy/server.js';
 
-/** Port the proxy listens on when `--port` is omitted. */
+/** Port the proxy listens on when neither `--port` nor a config supplies one. */
 export const DEFAULT_PORT = 4000;
 
 /**
@@ -34,12 +35,23 @@ export class CliError extends Error {
   }
 }
 
-/** A successfully parsed command line asking for the proxy to start. */
+/**
+ * A successfully parsed command line asking for the proxy to start.
+ *
+ * Everything the user did not type is left `undefined` rather than defaulted
+ * here: a config file may still supply it, and only once that has been read can
+ * anything be settled. Turning this into a runnable command is `resolve.ts`'s
+ * job.
+ */
 export interface CliCommand {
-  /** TCP port to listen on. */
-  readonly port: number;
-  /** Options handed straight to `createProxyServer`. */
-  readonly proxy: ProxyServerOptions;
+  /** Path given to `--config`, if any. */
+  readonly configPath: string | undefined;
+  /** Port given to `--port`, if any. */
+  readonly port: number | undefined;
+  /** Target given to `--target`, if any. */
+  readonly target: string | undefined;
+  /** Chaos flags the user actually typed, and only those. */
+  readonly chaos: ChaosOptions;
 }
 
 /**
@@ -57,9 +69,12 @@ so you can test how an application handles latency, errors and timeouts.
 
 Usage:
   ${CLI_NAME} --target <url> [options]
+  ${CLI_NAME} --config <path> [options]
 
 Options:
-  --target <url>            Required. API to forward to (http: or https:).
+  --target <url>            API to forward to (http: or https:). Required
+                            unless the config file supplies it.
+  --config <path>           YAML config file with defaults and endpoint rules.
   --port <1-65535>          Port to listen on. Default: ${DEFAULT_PORT}.
   --latency <ms>            Fixed delay added to every request.
   --error-rate <0-1>        Fraction of requests answered with a synthetic error.
@@ -73,13 +88,18 @@ The proxy listens on ${LISTEN_HOST} only, so it is never exposed to the network.
 Each request receives at most one injected outcome, decided in this order:
 latency delay, then timeout, then error, then forwarding upstream.
 
+A config file adds per-endpoint rules; the first rule whose "match" fits the
+request path wins. Flags beat config values, which beat the built-in defaults.
+
 Examples:
   ${CLI_NAME} --target http://localhost:3000
 
   ${CLI_NAME} \\
     --target http://localhost:3000 \\
     --latency 500 \\
-    --error-rate 0.2`;
+    --error-rate 0.2
+
+  ${CLI_NAME} --config chaos.yml`;
 
 /** Pointer appended to usage errors, so the user knows where to look. */
 export const USAGE_HINT = `Run \`${CLI_NAME} --help\` for usage.`;
@@ -140,18 +160,19 @@ function toNumber(flag: string, raw: string): number {
 /**
  * Reads `--port`.
  *
- * Unlike the chaos options there is no core validator to defer to, so the CLI
- * owns this range. Out-of-range ports are rejected rather than clamped, so a
- * typo cannot quietly move the listener somewhere else.
+ * Unlike the chaos options there is no proxy-core validator to defer to, so the
+ * range lives in the config schema instead, shared with the config file's own
+ * `port`. Out-of-range ports are rejected rather than clamped, so a typo cannot
+ * quietly move the listener somewhere else.
  *
  * @throws {CliError} If the value is not an integer from 1 to 65535.
  */
 function toPort(raw: string): number {
   const value = toNumber('port', raw);
 
-  if (!Number.isInteger(value) || value < 1 || value > 65_535) {
+  if (!isValidPort(value)) {
     throw new CliError(
-      `Invalid --port ${JSON.stringify(raw)}: expected an integer between 1 and 65535.`,
+      `Invalid --port ${JSON.stringify(raw)}: expected an integer between ${PORT_MIN} and ${PORT_MAX}.`,
     );
   }
 
@@ -182,6 +203,7 @@ export function parseCliArgs(argv: readonly string[]): ParsedCli {
       allowPositionals: false,
       options: {
         target: { type: 'string' },
+        config: { type: 'string' },
         port: { type: 'string' },
         latency: { type: 'string' },
         'error-rate': { type: 'string' },
@@ -204,15 +226,29 @@ export function parseCliArgs(argv: readonly string[]): ParsedCli {
     return { kind: 'version' };
   }
 
+  const configPath = values.config;
+
+  if (configPath !== undefined && (typeof configPath !== 'string' || configPath === '')) {
+    throw new CliError('Invalid --config: expected a path, for example --config chaos.yml.');
+  }
+
   const target = values.target;
 
-  if (typeof target !== 'string' || target === '') {
+  if (target !== undefined && (typeof target !== 'string' || target === '')) {
+    throw new CliError(
+      'Invalid --target: expected a URL, for example --target http://localhost:3000.',
+    );
+  }
+
+  // Without a config file there is nowhere else a target could come from, so
+  // the mistake is worth reporting straight away. With one, the check waits
+  // until the file has been read.
+  if (target === undefined && configPath === undefined) {
     throw new CliError(
       'Missing required option --target, for example --target http://localhost:3000.',
     );
   }
 
-  const port = typeof values.port === 'string' ? toPort(values.port) : DEFAULT_PORT;
   const latencyMs = optionalNumber(values.latency, 'latency');
   const errorRate = optionalNumber(values['error-rate'], 'error-rate');
   const errorStatus = optionalNumber(values['error-status'], 'error-status');
@@ -220,9 +256,8 @@ export function parseCliArgs(argv: readonly string[]): ParsedCli {
   const timeoutMs = optionalNumber(values.timeout, 'timeout');
 
   // Flags that were not given are left off entirely rather than passed as
-  // `undefined`, so the proxy core applies its own defaults.
-  const proxy: ProxyServerOptions = {
-    target,
+  // `undefined`, so a config value or the proxy core's own default can apply.
+  const chaos: ChaosOptions = {
     ...(latencyMs !== undefined ? { latencyMs } : {}),
     ...(errorRate !== undefined ? { errorRate } : {}),
     ...(errorStatus !== undefined ? { errorStatus } : {}),
@@ -230,5 +265,13 @@ export function parseCliArgs(argv: readonly string[]): ParsedCli {
     ...(timeoutMs !== undefined ? { timeoutMs } : {}),
   };
 
-  return { kind: 'run', command: { port, proxy } };
+  return {
+    kind: 'run',
+    command: {
+      configPath,
+      port: typeof values.port === 'string' ? toPort(values.port) : undefined,
+      target,
+      chaos,
+    },
+  };
 }
