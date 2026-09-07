@@ -393,3 +393,47 @@ inheritance or composition, no applying two at once, and no per-rule or per-endp
 It is built on `node:http` and `node:https`, with `yaml` as its one runtime dependency — parsing
 YAML by hand would be a defect waiting to happen, and it is the only thing the package needs that
 the standard library does not provide.
+
+## Distribution and release
+
+The repository and the package are not the same thing, and the difference is where a tool like
+this usually breaks: everything works against `src/` with `node_modules/` present, and then the
+first person to install it finds a `bin` entry pointing at a file that was never packed.
+
+What ships is therefore narrow and stated rather than inferred. `files` is `dist`, minus the
+source and declaration maps, plus `examples/` — npm adds `package.json`, `README.md` and `LICENSE`
+on its own. The maps are excluded because they name files in `src/`, which deliberately does not
+ship: a map whose sources are absent points at nothing. `src/`, `tests/`, `docs/` and `.github/`
+are the repository's business and not a consumer's. `prepack` rebuilds `dist/` before anything is
+packed, so a stale or missing build cannot become a tarball.
+
+The public API is one export, `createProxyServer`, plus its types. `exports` has a single `.` entry
+and no wildcard, so the config layer, the CLI, the preset table, the seeded generator and the log
+formatter are all reachable in `dist/` and none of them are importable. That is deliberate: they
+are how this tool is built, not what it offers.
+
+`scripts/package-smoke.mjs` is what proves any of that. It packs the package, installs the tarball
+into a temporary project outside the repository, and drives the installed copy — asserting what did
+and did not ship, that the `bin` target exists with its shebang intact, that `--help` and
+`--version` work, that `createProxyServer` imports, that a real request is forwarded and an
+injected error is not, and that `SIGINT` and `SIGTERM` exit `0`. It is a Node script rather than a
+shell one so it runs the same on macOS and Linux, and it cleans up its tarball, its temporary
+directory and its child processes in a `finally`. CI runs it on both platforms, on top of a
+quality job across Node 22 and 24 — the oldest line `engines` claims and the current one.
+
+Node support is `>=22.12` because that is what has actually been tested. Broadening it to Node 20
+would mean claiming something no run has checked, which is worse than a narrower range.
+
+Releases are cut from tags rather than from pushes. `.github/workflows/release.yml` fires on a
+`v*` tag or a manual dispatch, checks the tag against the manifest version before it builds
+anything, runs the quality gate and the package smoke test, packs the tarball and attaches it to a
+GitHub Release. A manual dispatch is a dry run and never a release: it produces the artifact and
+stops, whichever branch or tag it was started from, because creating the release requires the push
+event as well as the tag. That condition is deliberately narrower than the one guarding the version
+check, so a run that creates a release has always verified the tag first — a property a test
+asserts rather than two conditions that happen to match. It is the only workflow with write permission, and it holds no npm token: publishing
+to the registry is a deliberate manual step, because the package name is not owned yet and
+automating a publish nobody can perform would be automation for its own sake.
+
+The version in the manifest is bumped in its own commit immediately before the tag, never as part
+of the work being released. `docs/release-checklist.md` is the sequence.

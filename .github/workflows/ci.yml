@@ -6,10 +6,28 @@ on:
   pull_request:
     branches: [main]
 
+# Nothing in CI writes to the repository; the release workflow is the only place
+# that needs more than this.
+permissions:
+  contents: read
+
+# A branch that gets two pushes in a minute does not need two full runs, but a
+# run on `main` is the one recorded against that commit, so it is left alone.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
-  ci:
-    name: Verify
+  quality:
+    name: Verify (Node ${{ matrix.node }})
     runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # `engines` says >=22.12, so the oldest supported line and the current
+        # one are both tested. Anything in between is the same major.
+        node: ['22', '24']
 
     steps:
       - name: Check out repository
@@ -18,7 +36,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: ${{ matrix.node }}
           cache: npm
 
       - name: Install dependencies
@@ -43,3 +61,31 @@ jobs:
         run: |
           node dist/cli.js --version
           node dist/cli.js --help
+
+  package-smoke:
+    name: Packed package (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # What a consumer receives is a tarball, so it is installed and driven
+        # on both platforms the project claims to work on. Windows is not
+        # claimed and so is not tested; see README "Requirements".
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Pack, install and drive the package
+        run: npm run package:smoke

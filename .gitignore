@@ -8,6 +8,10 @@ dist/
 # Test output
 coverage/
 
+# Packed release artifacts. `npm run package:smoke` packs into a temporary
+# directory, but a manual `npm pack` writes here.
+*.tgz
+
 # Logs
 logs/
 *.log

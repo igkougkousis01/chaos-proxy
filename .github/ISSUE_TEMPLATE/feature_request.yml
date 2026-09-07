@@ -1,0 +1,30 @@
+name: Feature request
+description: Suggest a capability Chaos Proxy does not have.
+labels: [enhancement]
+
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to test?
+      description: The resilience behaviour you want to exercise, rather than the feature itself.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would Chaos Proxy do?
+      description: A flag, a config field, or a behaviour — whatever shape you have in mind.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What did you try instead?
+      description: |
+        Existing options, or another tool. `docs/project-overview.md` lists what is deliberately
+        out of scope.
+    validations:
+      required: false
