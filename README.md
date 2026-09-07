@@ -54,4 +54,3 @@ node dist/cli.js
 ## License
 
 MIT
-
