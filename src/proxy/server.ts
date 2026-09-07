@@ -16,6 +16,10 @@ import { performance } from 'node:perf_hooks';
  * except {@link errorStatus} and {@link timeoutMs}, which only choose how an
  * injected error or timeout is shaped and have their own defaults.
  *
+ * At most one kind of chaos befalls a request, decided after any
+ * {@link latencyMs} delay in a fixed order: {@link resetRate}, then
+ * {@link timeoutRate}, then {@link errorRate}, then ordinary forwarding.
+ *
  * The same shape is used for the static configuration handed to
  * {@link createProxyServer} and for whatever a {@link ProxyServerOptions.resolveChaos}
  * function returns for a single request, so both are validated by exactly the
@@ -35,7 +39,9 @@ export interface ChaosOptions {
    * Probability, from `0` to `1`, that a request is answered with a synthetic
    * error instead of being forwarded upstream. Omitted or `0` means never.
    *
-   * The decision is made per request, after any {@link latencyMs} delay.
+   * The decision is made per request, after any {@link latencyMs} delay and
+   * last of the three, so it only ever sees the requests {@link resetRate} and
+   * {@link timeoutRate} both declined.
    */
   readonly errorRate?: number;
 
@@ -51,8 +57,8 @@ export interface ChaosOptions {
    * `0` means never.
    *
    * The decision is made per request, after any {@link latencyMs} delay and
-   * before {@link errorRate}, so a request selected for a timeout is never also
-   * given a synthetic HTTP error.
+   * after {@link resetRate} but before {@link errorRate}, so a request selected
+   * for a timeout is never also given a synthetic HTTP error.
    */
   readonly timeoutRate?: number;
 
@@ -64,6 +70,23 @@ export interface ChaosOptions {
    * waiting: a deterministic edge case rather than a useful amount of chaos.
    */
   readonly timeoutMs?: number;
+
+  /**
+   * Probability, from `0` to `1`, that a request has its client connection
+   * abruptly terminated instead of being answered at all. Omitted or `0` means
+   * never.
+   *
+   * This is a transport failure rather than an HTTP one: no status line, no
+   * headers and no body are sent, no upstream connection is opened, and the
+   * request body is never read. The client sees a dropped or reset connection —
+   * a `fetch` rejection rather than a response it can inspect.
+   *
+   * The decision is made per request, after any {@link latencyMs} delay and
+   * before every other kind of chaos, because a connection that goes away is
+   * the most fundamental of the failures here: a request selected for a reset
+   * is never also given a synthetic timeout or a synthetic HTTP error.
+   */
+  readonly resetRate?: number;
 }
 
 /**
@@ -78,20 +101,25 @@ export interface ResolvedChaosOptions {
   readonly errorStatus: number;
   readonly timeoutRate: number;
   readonly timeoutMs: number;
+  readonly resetRate: number;
 }
 
 /**
  * What became of one request.
  *
- * The set is deliberately small and closed: it names which of the four fates a
+ * The set is deliberately small and closed: it names which of the five fates a
  * request met, and nothing about why. Which rule matched it, which random draw
  * selected it, and what the upstream said about it are all outside it.
  *
  * `forwarded` means the request reached the upstream and the upstream's own
  * response was returned — including when that response was an error, since a
  * `500` the upstream chose is a different event from a `500` the proxy invented.
+ *
+ * `connection:reset` is the one outcome that is not an HTTP response at all: the
+ * proxy destroyed the client connection, so the request has no status code.
  */
-export type RequestOutcome = 'forwarded' | 'injected:error' | 'injected:timeout' | 'upstream:error';
+export type RequestOutcome =
+  'forwarded' | 'injected:error' | 'injected:timeout' | 'connection:reset' | 'upstream:error';
 
 /**
  * What happened to one completed request, as handed to
@@ -113,8 +141,15 @@ export interface RequestLogEvent {
    */
   readonly pathname: string;
 
-  /** Status the client actually received. */
-  readonly statusCode: number;
+  /**
+   * Status the client actually received, or `null` when it received none.
+   *
+   * `null` is only ever a `connection:reset`: the connection was destroyed
+   * before any response was written, so there is no status to report. The key
+   * is always present and never carries an invented status — `0`, `499` and
+   * `444` would all claim an HTTP outcome that never happened.
+   */
+  readonly statusCode: number | null;
 
   /**
    * Milliseconds from the request arriving at the proxy to its response
@@ -125,7 +160,7 @@ export interface RequestLogEvent {
    */
   readonly durationMs: number;
 
-  /** Which of the four fates the request met. */
+  /** Which of the five fates the request met. */
   readonly outcome: RequestOutcome;
 
   /**
@@ -184,13 +219,14 @@ export interface ProxyServerOptions extends ChaosOptions {
    * generator, the same options and the same sequence of requests produce the
    * same sequence of outcomes. That is what `chaos-proxy --seed` is.
    *
-   * There is exactly one of these per server, and both chaos decisions draw
-   * from it in a fixed order — the timeout decision first, then the error
-   * decision, and only when the timeout decision declined. A request therefore
-   * consumes one or two values depending on what happened to it, which makes
-   * the sequence depend on the order requests reach the decision. Requests
-   * handled concurrently can interleave their draws, so reproducibility holds
-   * for a given request ordering rather than for a given set of requests.
+   * There is exactly one of these per server, and every chaos decision draws
+   * from it in a fixed order — the reset decision first, then the timeout
+   * decision, then the error decision, each consulted only when the ones before
+   * it declined. A request therefore consumes one, two or three values
+   * depending on what happened to it, which makes the sequence depend on the
+   * order requests reach the decision. Requests handled concurrently can
+   * interleave their draws, so reproducibility holds for a given request
+   * ordering rather than for a given set of requests.
    */
   readonly random?: () => number;
 }
@@ -325,6 +361,7 @@ const BUILT_IN_CHAOS: ResolvedChaosOptions = {
   errorStatus: DEFAULT_ERROR_STATUS,
   timeoutRate: 0,
   timeoutMs: DEFAULT_TIMEOUT_MS,
+  resetRate: 0,
 };
 
 /**
@@ -348,23 +385,41 @@ export function resolveChaosOptions(
     errorStatus: parseErrorStatus(options.errorStatus, base.errorStatus),
     timeoutRate: parseRate(options.timeoutRate, 'timeoutRate', base.timeoutRate),
     timeoutMs: parseDurationMs(options.timeoutMs, 'timeoutMs', base.timeoutMs),
+    resetRate: parseRate(options.resetRate, 'resetRate', base.resetRate),
   };
 }
 
 /**
+ * Decides whether one request should have its client connection destroyed.
+ *
+ * This, {@link shouldInjectTimeout} and {@link shouldInjectError} are the only
+ * randomness in the proxy, one draw each. Keeping them in pure functions keeps
+ * the random source out of the forwarding path and makes partial rates testable
+ * without statistical assertions. `random` returns a value in `[0, 1)`, so a
+ * rate of `0` never injects and a rate of `1` always does.
+ *
+ * The three draws are sequential rather than independent overall probabilities.
+ * This one is taken first, because a connection that goes away is the most
+ * fundamental failure of the three and there is nothing left to time out or to
+ * answer once it has: `resetRate: 0.1` with `timeoutRate: 0.5` means 10% of
+ * requests are reset and half of the remaining 90% — 45% overall — time out.
+ *
+ * @internal Not part of the public API; configure via {@link createProxyServer}.
+ */
+export function shouldResetConnection(
+  resetRate: number,
+  random: () => number = Math.random,
+): boolean {
+  return random() < resetRate;
+}
+
+/**
  * Decides whether one request should be held open and then answered with a
- * synthetic timeout.
+ * synthetic timeout, once {@link shouldResetConnection} has declined it.
  *
- * This and {@link shouldInjectError} are the only randomness in the proxy, one
- * draw each. Keeping them in pure functions keeps the random source out of the
- * forwarding path and makes partial rates testable without statistical
- * assertions. `random` returns a value in `[0, 1)`, so a rate of `0` never
- * injects and a rate of `1` always does.
- *
- * The two draws are sequential rather than independent overall probabilities:
- * this one is taken first, and {@link shouldInjectError} is consulted only when
- * it declines. `timeoutRate: 0.2` with `errorRate: 0.5` therefore means 20% of
- * requests time out and half of the remaining 80% — 40% overall — are failed.
+ * `timeoutRate: 0.2` with `errorRate: 0.5` means 20% of the requests that
+ * reached this decision time out, and half of the remaining 80% — 40% of them —
+ * are failed.
  *
  * @internal Not part of the public API; configure via {@link createProxyServer}.
  */
@@ -377,7 +432,8 @@ export function shouldInjectTimeout(
 
 /**
  * Decides whether one request should receive a synthetic error, once
- * {@link shouldInjectTimeout} has declined it.
+ * {@link shouldResetConnection} and {@link shouldInjectTimeout} have declined
+ * it.
  *
  * @internal Not part of the public API; configure via {@link createProxyServer}.
  */
@@ -472,8 +528,11 @@ function upstreamUrlFor(incoming: URL, target: URL): URL {
 /**
  * Records the fate of one request, for whoever is tracking its completion.
  *
- * Calling it more than once is harmless — the last outcome wins — because the
- * event is emitted from the response's own completion, never from here.
+ * Calling it more than once is harmless — the last outcome wins — because for
+ * every outcome but one the event is emitted from the response's own
+ * completion rather than from here. The exception is `connection:reset`, which
+ * has no completion to hang off and so is emitted as it is recorded; that
+ * emission is what the exactly-once guard exists for.
  */
 type ReportOutcome = (outcome: RequestOutcome) => void;
 
@@ -496,6 +555,12 @@ const NO_REPORT: ReportOutcome = () => {
  *
  * An outcome that was never recorded means the proxy never got as far as
  * choosing one — the client went away during a delay — and is likewise silent.
+ *
+ * A `connection:reset` is the one outcome that cannot wait for `close`: the
+ * proxy is about to destroy the socket, so the response will never become
+ * `writableFinished` and the close that follows is indistinguishable from a
+ * client that hung up. It is therefore emitted the moment it is recorded, and
+ * the guard below is what keeps that from also being reported a second time.
  */
 function trackCompletion(
   req: IncomingMessage,
@@ -505,27 +570,68 @@ function trackCompletion(
   onRequestComplete: (event: RequestLogEvent) => void,
 ): ReportOutcome {
   let outcome: RequestOutcome | undefined;
+  let emitted = false;
+
+  function emit(chosen: RequestOutcome, statusCode: number | null): void {
+    if (emitted) {
+      return;
+    }
+
+    emitted = true;
+    onRequestComplete({
+      method: req.method ?? '',
+      pathname: requestPathname(req.url ?? '/'),
+      statusCode,
+      durationMs: performance.now() - startedAt,
+      outcome: chosen,
+      latencyMs,
+    });
+  }
 
   res.once('close', () => {
     if (outcome === undefined || !res.writableFinished) {
       return;
     }
 
-    onRequestComplete({
-      method: req.method ?? '',
-      pathname: requestPathname(req.url ?? '/'),
-      // Read from the response rather than remembered separately, so the event
-      // can only ever report the status the client was actually sent.
-      statusCode: res.statusCode,
-      durationMs: performance.now() - startedAt,
-      outcome,
-      latencyMs,
-    });
+    // Read from the response rather than remembered separately, so the event
+    // can only ever report the status the client was actually sent.
+    emit(outcome, res.statusCode);
   });
 
   return (chosen) => {
     outcome = chosen;
+
+    if (chosen === 'connection:reset') {
+      // No status: the client was sent nothing at all, and inventing one would
+      // describe a transport failure as an HTTP answer.
+      emit(chosen, null);
+    }
   };
+}
+
+/**
+ * Destroys the client connection without writing anything to it.
+ *
+ * The socket is taken down rather than the response ended, which is the whole
+ * point: no status line, no headers and no body reach the client, so it sees a
+ * transport failure instead of an HTTP answer. Whatever of the request body is
+ * still unread goes with the socket, so nothing is consumed or buffered here.
+ *
+ * Destroying without an error argument means no `ECONNRESET` is manufactured on
+ * this side; the server keeps serving, and the outcome for this one request has
+ * already been recorded by the time this runs.
+ */
+function resetConnection(res: ServerResponse): void {
+  const socket = res.socket;
+
+  if (socket === null) {
+    // The connection is already gone; there is nothing left to destroy, and
+    // finishing the response off keeps it from being left pending.
+    res.destroy();
+    return;
+  }
+
+  socket.destroy();
 }
 
 /** Ends the response with a plain-text proxy error, if nothing was sent yet. */
@@ -640,8 +746,8 @@ const CHAOS_RESOLUTION_ERROR_BODY = 'Chaos Proxy configuration error';
  * @throws {TypeError} If `target` is not an absolute `http:` or `https:` URL.
  * @throws {RangeError} If `latencyMs` or `timeoutMs` is negative, `NaN`, or
  * infinite.
- * @throws {RangeError} If `errorRate` or `timeoutRate` is outside `0`-`1`,
- * `NaN`, or infinite.
+ * @throws {RangeError} If `errorRate`, `timeoutRate` or `resetRate` is outside
+ * `0`-`1`, `NaN`, or infinite.
  * @throws {RangeError} If `errorStatus` is not an integer from `400` to `599`.
  */
 export function createProxyServer(options: ProxyServerOptions): Server {
@@ -649,18 +755,24 @@ export function createProxyServer(options: ProxyServerOptions): Server {
   const staticChaos = resolveChaosOptions(options);
   const resolveChaos = options.resolveChaos;
   const onRequestComplete = options.onRequestComplete;
-  // One source for the whole server, read once: both decisions draw from it, so
-  // a seeded generator produces one reproducible stream rather than two that
-  // could drift apart.
+  // One source for the whole server, read once: every decision draws from it,
+  // so a seeded generator produces one reproducible stream rather than several
+  // that could drift apart.
   const random = options.random ?? Math.random;
 
   /**
-   * Starts one request, choosing exactly one outcome: a synthetic timeout, a
-   * synthetic error, or normal forwarding.
+   * Starts one request, choosing exactly one outcome: a destroyed connection, a
+   * synthetic timeout, a synthetic error, or normal forwarding.
    *
-   * Both injected outcomes answer from here, so no upstream connection is
-   * opened and no request body is read; Node discards the unread body as part
-   * of ending the response.
+   * The three injected outcomes are decided in that order and every one of them
+   * is answered from here, so no upstream connection is opened and no request
+   * body is read. Node discards the unread body as part of ending the response,
+   * and a destroyed socket takes it with it.
+   *
+   * The reset decision comes first because it is the most fundamental of the
+   * three: once the connection is gone there is nothing left to hold open or to
+   * answer. A request it selects therefore consumes exactly one random value
+   * and neither of the later decisions is consulted for it.
    */
   function initiate(
     req: IncomingMessage,
@@ -668,6 +780,14 @@ export function createProxyServer(options: ProxyServerOptions): Server {
     chaos: ResolvedChaosOptions,
     report: ReportOutcome,
   ): void {
+    if (shouldResetConnection(chaos.resetRate, random)) {
+      // Recorded before the socket goes, because destroying it is what makes
+      // the ordinary completion path unable to report this request at all.
+      report('connection:reset');
+      resetConnection(res);
+      return;
+    }
+
     if (shouldInjectTimeout(chaos.timeoutRate, random)) {
       runAfter(chaos.timeoutMs, res, () => {
         report('injected:timeout');

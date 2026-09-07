@@ -16,6 +16,15 @@ import type { RequestLogEvent } from '../proxy/server.js';
  */
 const METHOD_WIDTH = 6;
 
+/**
+ * Shown in the status column for a request that never received a status.
+ *
+ * A connection reset is a transport failure rather than an HTTP one, so the
+ * column says so in words. Any number here — `0`, `499`, `444` — would read as
+ * a status the client was sent, which is exactly what did not happen.
+ */
+const NO_STATUS = 'RESET';
+
 /** Two-digit clock field, for example `07`. */
 function twoDigits(value: number): string {
   return String(value).padStart(2, '0');
@@ -41,6 +50,7 @@ export function formatTimestamp(at: Date): string {
  * ```text
  * 12:41:03 GET    /api/users -> 200 42ms forwarded
  * 12:41:15 POST   /api/orders -> 503 520ms injected:error latency:+500ms
+ * 12:41:18 GET    /api/cart -> RESET 12ms connection:reset
  * ```
  *
  * Durations are rounded to whole milliseconds; sub-millisecond precision says
@@ -53,7 +63,7 @@ export function formatRequestLog(event: RequestLogEvent, at: Date): string {
     event.method.padEnd(METHOD_WIDTH),
     event.pathname,
     '->',
-    String(event.statusCode),
+    event.statusCode === null ? NO_STATUS : String(event.statusCode),
     `${Math.round(event.durationMs)}ms`,
     event.outcome,
   ];

@@ -10,8 +10,12 @@ import type { AddressInfo } from 'node:net';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { createProxyServer } from '../../src/index.js';
-import type { ProxyServerOptions, RequestLogEvent } from '../../src/index.js';
-import { shouldInjectError, shouldInjectTimeout } from '../../src/proxy/server.js';
+import type { ProxyServerOptions, RequestLogEvent, RequestOutcome } from '../../src/index.js';
+import {
+  shouldInjectError,
+  shouldInjectTimeout,
+  shouldResetConnection,
+} from '../../src/proxy/server.js';
 
 /** A request as it arrived at the temporary upstream server. */
 interface RecordedRequest {
@@ -148,6 +152,57 @@ function rawRequest(url: string, headers: OutgoingHttpHeaders): Promise<RawRespo
 
     req.on('error', reject);
     req.end();
+  });
+}
+
+/** What one raw request got: an HTTP response, or a transport failure. */
+interface RequestAttempt {
+  /** Status the client received, or `undefined` if it never got a response. */
+  readonly statusCode: number | undefined;
+  /** Whether the request failed at the transport level instead. */
+  readonly failed: boolean;
+}
+
+/**
+ * Sends a request and reports whether it received an HTTP response at all.
+ *
+ * `fetch` collapses every transport failure into one opaque `TypeError`, which
+ * would make "the connection went away" indistinguishable from "the proxy is
+ * not there"; the raw client keeps the two apart. Which error code a destroyed
+ * connection produces is deliberately not asserted on anywhere — `ECONNRESET`
+ * and a bare socket hang-up are both correct, and which one a platform gives is
+ * not something the proxy promises.
+ */
+function attempt(
+  url: string,
+  options: { readonly method?: string; readonly body?: string } = {},
+): Promise<RequestAttempt> {
+  return new Promise<RequestAttempt>((resolve, reject) => {
+    const req = httpRequest(url, { method: options.method ?? 'GET' }, (res) => {
+      readBody(res).then(
+        () => resolve({ statusCode: res.statusCode, failed: false }),
+        // A response whose body is cut off short is still a response: the
+        // status line reached the client, which is the distinction here.
+        () => resolve({ statusCode: res.statusCode, failed: false }),
+      );
+    });
+
+    req.on('error', () => {
+      resolve({ statusCode: undefined, failed: true });
+    });
+
+    if (options.body !== undefined) {
+      req.setHeader('content-type', 'application/json');
+      req.write(options.body);
+    }
+
+    req.end();
+    // Nothing here should ever take long enough to need this, but a hung socket
+    // must fail the test rather than hang the suite.
+    setTimeout(() => {
+      req.destroy();
+      reject(new Error(`timed out waiting for ${url}`));
+    }, 5000).unref();
   });
 }
 
@@ -293,6 +348,31 @@ describe('createProxyServer', () => {
   // useful deterministic edge case rather than a useful amount of chaos.
   it.each([0, 100, 30_000])('accepts a timeoutMs of %p', (timeoutMs) => {
     expect(() => createProxyServer({ target: 'http://localhost:5000', timeoutMs })).not.toThrow();
+  });
+
+  // Exactly the rules the other rates are held to, because it goes through the
+  // same shared validator rather than one of its own.
+  it.each([-0.1, 1.1, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY])(
+    'rejects a resetRate of %p',
+    (resetRate) => {
+      expect(() => createProxyServer({ target: 'http://localhost:5000', resetRate })).toThrow(
+        RangeError,
+      );
+    },
+  );
+
+  it.each([0, 0.25, 1])('accepts a resetRate of %p', (resetRate) => {
+    expect(() => createProxyServer({ target: 'http://localhost:5000', resetRate })).not.toThrow();
+  });
+
+  it('accepts an omitted resetRate, which is what every existing caller passes', () => {
+    expect(() => createProxyServer({ target: 'http://localhost:5000' })).not.toThrow();
+  });
+
+  it('names resetRate in its complaint, so the value can be found', () => {
+    expect(() => createProxyServer({ target: 'http://localhost:5000', resetRate: 5 })).toThrow(
+      'Invalid resetRate 5: expected a number between 0 and 1 inclusive.',
+    );
   });
 });
 
@@ -886,6 +966,234 @@ describe('timeout injection', () => {
   });
 });
 
+describe('shouldResetConnection', () => {
+  it.each([
+    [0.25, true],
+    [0.75, false],
+  ])('resets for a random value of %p at a resetRate of 0.5: %p', (value, expected) => {
+    expect(shouldResetConnection(0.5, () => value)).toBe(expected);
+  });
+
+  it('never resets at a resetRate of 0', () => {
+    expect(shouldResetConnection(0, () => 0)).toBe(false);
+  });
+
+  it('always resets at a resetRate of 1', () => {
+    // The largest value Math.random() can return is just below 1.
+    expect(shouldResetConnection(1, () => 0.999999999999999)).toBe(true);
+  });
+
+  it('is drawn before the timeout and error rates, which only see what it declines', () => {
+    // Mirrors the order the request handler applies the three predicates in,
+    // with scripted draws standing in for Math.random(). Every rate here is
+    // high enough that any of them would have selected any of these values, so
+    // the only thing deciding the outcome is which predicate saw it first.
+    const draws = [0.1, 0.9, 0.2, 0.9, 0.9, 0.3];
+    const next = (): number => draws.shift() ?? 0;
+
+    // First request: reset, so nothing after it is consulted and it costs one
+    // draw rather than three.
+    expect(shouldResetConnection(0.5, next)).toBe(true);
+
+    // Second request: not reset, so the timeout decision takes the next draw.
+    expect(shouldResetConnection(0.5, next)).toBe(false);
+    expect(shouldInjectTimeout(0.5, next)).toBe(true);
+
+    // Third request: neither reset nor timed out, so the error decision takes
+    // the third draw — the only way to reach `0.3` in this script.
+    expect(shouldResetConnection(0.5, next)).toBe(false);
+    expect(shouldInjectTimeout(0.5, next)).toBe(false);
+    expect(shouldInjectError(0.5, next)).toBe(true);
+
+    expect(draws).toEqual([]);
+  });
+});
+
+describe('connection reset injection', () => {
+  it('forwards every request when resetRate is 0', async () => {
+    const upstream = await startUpstream((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/plain' });
+      res.end('ok');
+    });
+    const proxyUrl = await startProxy(upstream.origin, { resetRate: 0 });
+
+    const response = await fetch(`${proxyUrl}/api/users`);
+
+    expect(response.status).toBe(200);
+    await expect(response.text()).resolves.toBe('ok');
+    expect(upstream.requests).toHaveLength(1);
+  });
+
+  it('destroys the connection without an HTTP response when resetRate is 1', async () => {
+    const upstream = await startUpstream((_req, res) => {
+      res.writeHead(200);
+      res.end('should not be reached');
+    });
+    const proxyUrl = await startProxy(upstream.origin, { resetRate: 1 });
+
+    const result = await attempt(`${proxyUrl}/api/users?page=2`);
+
+    // A transport failure, not a status: nothing was written to the client.
+    expect(result.failed).toBe(true);
+    expect(result.statusCode).toBeUndefined();
+
+    // Long enough that a connection the proxy had opened would have been
+    // accepted by now; asserting straight away would race the dial and pass
+    // whether or not one was made.
+    await sleep(100);
+    expect(upstream.requests).toHaveLength(0);
+    expect(upstream.connectionCount()).toBe(0);
+  });
+
+  it('never turns a reset into a 5xx of any kind', async () => {
+    const upstream = await startUpstream((_req, res) => {
+      res.writeHead(200);
+      res.end('should not be reached');
+    });
+    const proxyUrl = await startProxy(upstream.origin, { resetRate: 1 });
+
+    // `fetch` is the client most applications actually use, and it must see a
+    // rejection rather than a 500, 502 or 503 it could handle as a response.
+    await expect(fetch(`${proxyUrl}/api/users`)).rejects.toThrow();
+  });
+
+  it('keeps serving after a reset', async () => {
+    const upstream = await startUpstream((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/plain' });
+      res.end('ok');
+    });
+    const proxy = createProxyServer({
+      target: upstream.origin,
+      // Only the first path is reset, so the same server has to survive it and
+      // then answer normally.
+      resolveChaos: (request) =>
+        request.url?.startsWith('/reset/') === true ? { resetRate: 1 } : {},
+    });
+    const { port } = await start(proxy);
+    const proxyUrl = `http://127.0.0.1:${port}`;
+
+    expect(await attempt(`${proxyUrl}/reset/one`)).toEqual({ statusCode: undefined, failed: true });
+    expect(await attempt(`${proxyUrl}/reset/two`)).toEqual({ statusCode: undefined, failed: true });
+
+    const response = await fetch(`${proxyUrl}/api/users`);
+
+    expect(response.status).toBe(200);
+    await expect(response.text()).resolves.toBe('ok');
+    expect(upstream.requests.map((request) => request.url)).toEqual(['/api/users']);
+  });
+
+  it('resets a request with a body without forwarding or buffering it', async () => {
+    const upstream = await startUpstream((_req, res) => {
+      res.writeHead(200);
+      res.end('should not be reached');
+    });
+    const proxyUrl = await startProxy(upstream.origin, { resetRate: 1 });
+
+    const result = await attempt(`${proxyUrl}/api/users`, {
+      method: 'POST',
+      body: JSON.stringify({ name: 'ada' }),
+    });
+
+    expect(result.failed).toBe(true);
+
+    // See above: a dial would need a moment to be accepted, so the wait is
+    // what makes "no upstream connection" an assertion rather than a race.
+    await sleep(100);
+    expect(upstream.requests).toHaveLength(0);
+    expect(upstream.connectionCount()).toBe(0);
+
+    // The unread body did not wedge the proxy.
+    const next = await attempt(`${proxyUrl}/api/users`);
+    expect(next.failed).toBe(true);
+  });
+
+  it('resets only after the configured latency has elapsed', async () => {
+    const upstream = await startUpstream((_req, res) => {
+      res.writeHead(200);
+      res.end('should not be reached');
+    });
+    const proxyUrl = await startProxy(upstream.origin, { latencyMs: 100, resetRate: 1 });
+
+    const startedAt = performance.now();
+    const result = await attempt(`${proxyUrl}/api/users`);
+    const elapsed = performance.now() - startedAt;
+
+    expect(result.failed).toBe(true);
+    // Lower bound only, with slack for timer coarseness and loaded CI runners.
+    expect(elapsed).toBeGreaterThanOrEqual(75);
+    await sleep(100);
+    expect(upstream.connectionCount()).toBe(0);
+  });
+
+  it('resets rather than timing out or failing when all three are certain', async () => {
+    const upstream = await startUpstream((_req, res) => {
+      res.writeHead(200);
+      res.end('should not be reached');
+    });
+    const proxyUrl = await startProxy(upstream.origin, {
+      resetRate: 1,
+      timeoutRate: 1,
+      timeoutMs: 20,
+      errorRate: 1,
+    });
+
+    const result = await attempt(`${proxyUrl}/api/users`);
+
+    // Reset is decided first, so neither of the other two ever answers.
+    expect(result.failed).toBe(true);
+    expect(result.statusCode).toBeUndefined();
+  });
+
+  it('falls through to the timeout when the reset is not selected', async () => {
+    const upstream = await startUpstream((_req, res) => {
+      res.writeHead(200);
+      res.end('should not be reached');
+    });
+    const proxyUrl = await startProxy(upstream.origin, {
+      resetRate: 0,
+      timeoutRate: 1,
+      timeoutMs: 20,
+      errorRate: 1,
+    });
+
+    const response = await fetch(`${proxyUrl}/api/users`);
+
+    expect(response.status).toBe(504);
+    await expect(response.text()).resolves.toBe('Chaos Proxy injected timeout');
+  });
+
+  it('resets nothing when the client disconnects during the delay', async () => {
+    const latencyMs = 200;
+    const upstream = await startUpstream((_req, res) => {
+      res.writeHead(200);
+      res.end('should not be reached');
+    });
+    const proxy = createProxyServer({ target: upstream.origin, latencyMs, resetRate: 1 });
+    const delayStarted = new Promise<void>((resolve) => {
+      proxy.once('request', () => {
+        resolve();
+      });
+    });
+    const { port } = await start(proxy);
+    const proxyUrl = `http://127.0.0.1:${port}`;
+
+    const req = httpRequest(`${proxyUrl}/api/users`);
+    req.on('error', () => {
+      // Expected: the client aborts itself below.
+    });
+    req.end();
+
+    await delayStarted;
+    req.destroy();
+    await sleep(latencyMs * 2);
+
+    expect(upstream.connectionCount()).toBe(0);
+    // Destroying an already-gone connection did not take the proxy down.
+    const next = await attempt(`${proxyUrl}/api/users`);
+    expect(next.failed).toBe(true);
+  });
+});
+
 describe('per-request chaos', () => {
   it('leaves the static options in charge when no resolver is given', async () => {
     const upstream = await startUpstream((_req, res) => {
@@ -1271,6 +1579,127 @@ describe('request completion events', () => {
     expect(events).toEqual([]);
   });
 
+  it('reports a connection reset once, with no status code at all', async () => {
+    const latencyMs = 40;
+    const upstream = await startUpstream((_req, res) => {
+      res.writeHead(200);
+      res.end('should not be reached');
+    });
+    const proxy = await startRecordingProxy(upstream.origin, { latencyMs, resetRate: 1 });
+
+    const result = await attempt(`${proxy.baseUrl}/api/payments/123?token=secret`, {
+      method: 'POST',
+      body: JSON.stringify({ amount: 1 }),
+    });
+    expect(result.failed).toBe(true);
+    await proxy.waitForEvents(1);
+
+    expect(proxy.events).toHaveLength(1);
+    expect(proxy.events[0]).toMatchObject({
+      method: 'POST',
+      pathname: '/api/payments/123',
+      // No HTTP response reached the client, so there is no status to report
+      // and none is invented.
+      statusCode: null,
+      outcome: 'connection:reset',
+      latencyMs,
+    });
+    // Lower bound only, with slack for timer coarseness and loaded CI runners.
+    expect(proxy.events[0]?.durationMs).toBeGreaterThanOrEqual(latencyMs / 2);
+    await sleep(100);
+    expect(upstream.connectionCount()).toBe(0);
+  });
+
+  it('reports a reset exactly once, and not again when the socket closes', async () => {
+    const upstream = await startUpstream((_req, res) => {
+      res.writeHead(200);
+      res.end('should not be reached');
+    });
+    const proxy = await startRecordingProxy(upstream.origin, { resetRate: 1 });
+
+    await attempt(`${proxy.baseUrl}/api/users`);
+    await proxy.waitForEvents(1);
+    // Long enough for a second emission from the response's own close listener
+    // to have arrived if the destroyed socket produced one.
+    await sleep(100);
+
+    expect(proxy.events).toHaveLength(1);
+  });
+
+  it('does not misreport a reset as a client that hung up', async () => {
+    const upstream = await startUpstream((_req, res) => {
+      res.writeHead(200);
+      res.end('should not be reached');
+    });
+    const proxy = await startRecordingProxy(upstream.origin, { resetRate: 1 });
+
+    await attempt(`${proxy.baseUrl}/api/users`);
+    await proxy.waitForEvents(1);
+
+    // A client that abandons a request reports nothing; a reset the proxy chose
+    // is the proxy's own doing and must still be reported.
+    expect(proxy.events.map((event) => event.outcome)).toEqual(['connection:reset']);
+  });
+
+  it('reports nothing when the client disconnects before the reset is decided', async () => {
+    const latencyMs = 200;
+    const upstream = await startUpstream((_req, res) => {
+      res.writeHead(204);
+      res.end();
+    });
+    const events: RequestLogEvent[] = [];
+    const proxy = createProxyServer({
+      target: upstream.origin,
+      latencyMs,
+      resetRate: 1,
+      onRequestComplete: (event) => {
+        events.push(event);
+      },
+    });
+    const delayStarted = new Promise<void>((resolve) => {
+      proxy.once('request', () => {
+        resolve();
+      });
+    });
+    const { port } = await start(proxy);
+
+    const req = httpRequest(`http://127.0.0.1:${port}/api/users`);
+    req.on('error', () => {
+      // Expected: the client aborts itself below.
+    });
+    req.end();
+
+    await delayStarted;
+    req.destroy();
+    await sleep(latencyMs * 2);
+
+    // The proxy never got as far as choosing an outcome, so it did not reset
+    // anything and has nothing to report.
+    expect(events).toEqual([]);
+    expect(upstream.connectionCount()).toBe(0);
+  });
+
+  it('reports a reset chosen by an endpoint rule alongside the requests it forwards', async () => {
+    const upstream = await startUpstream((_req, res) => {
+      res.writeHead(200);
+      res.end('ok');
+    });
+    const proxy = await startRecordingProxy(upstream.origin, {
+      resolveChaos: (request) =>
+        request.url?.startsWith('/reset/') === true ? { resetRate: 1 } : {},
+    });
+
+    await attempt(`${proxy.baseUrl}/reset/test`);
+    await proxy.waitForEvents(1);
+    await (await fetch(`${proxy.baseUrl}/api/users`)).text();
+    await proxy.waitForEvents(2);
+
+    expect(proxy.events.map((event) => [event.pathname, event.outcome, event.statusCode])).toEqual([
+      ['/reset/test', 'connection:reset', null],
+      ['/api/users', 'forwarded', 200],
+    ]);
+  });
+
   it('stays silent when no completion hook is given', async () => {
     const upstream = await startUpstream((_req, res) => {
       res.writeHead(200);
@@ -1285,5 +1714,85 @@ describe('request completion events', () => {
 
     expect(log).not.toHaveBeenCalled();
     expect(error).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * `RequestLogEvent.statusCode` widened from `number` to `number | null` when
+ * connection resets arrived, which is a real change to the package's public
+ * API. These are the compatibility checks for it: they compile against the
+ * exported types, so a consumer written this way is known to still type-check.
+ */
+describe('the public completion event shape', () => {
+  const forwarded: RequestLogEvent = {
+    method: 'GET',
+    pathname: '/api/users',
+    statusCode: 200,
+    durationMs: 42,
+    outcome: 'forwarded',
+    latencyMs: 0,
+  };
+
+  const reset: RequestLogEvent = {
+    method: 'GET',
+    pathname: '/api/cart',
+    statusCode: null,
+    durationMs: 12,
+    outcome: 'connection:reset',
+    latencyMs: 0,
+  };
+
+  it('always carries the statusCode key, nullable rather than optional', () => {
+    // Nullable, not optional: an event is a fixed set of facts, so a consumer
+    // never has to tell "no status" from "an older version that omitted it".
+    expect('statusCode' in reset).toBe(true);
+    expect(reset.statusCode).toBeNull();
+    expect(forwarded.statusCode).toBe(200);
+  });
+
+  it('narrows to a number for a consumer that checks for null', () => {
+    function statusText(event: RequestLogEvent): string {
+      if (event.statusCode === null) {
+        return 'no response';
+      }
+
+      // Narrowed to `number` here, so arithmetic and `.toFixed` still compile.
+      return String(Math.trunc(event.statusCode / 100));
+    }
+
+    expect(statusText(forwarded)).toBe('2');
+    expect(statusText(reset)).toBe('no response');
+  });
+
+  it('keeps the key through a JSON round trip', () => {
+    // `null` survives serialisation where an absent optional field would not,
+    // which is what a consumer forwarding these events to a log sink gets.
+    expect(JSON.parse(JSON.stringify(reset))).toEqual({ ...reset, statusCode: null });
+    expect(JSON.stringify(reset)).toContain('"statusCode":null');
+  });
+
+  it('offers connection:reset as one of the closed set of outcomes', () => {
+    const every: RequestOutcome[] = [
+      'forwarded',
+      'injected:error',
+      'injected:timeout',
+      'connection:reset',
+      'upstream:error',
+    ];
+
+    // A consumer switching exhaustively over the union covers this one too.
+    function isTransportFailure(outcome: RequestOutcome): boolean {
+      switch (outcome) {
+        case 'connection:reset':
+          return true;
+        case 'forwarded':
+        case 'injected:error':
+        case 'injected:timeout':
+        case 'upstream:error':
+          return false;
+      }
+    }
+
+    expect(every.filter(isTransportFailure)).toEqual(['connection:reset']);
   });
 });

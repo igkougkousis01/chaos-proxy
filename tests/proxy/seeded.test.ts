@@ -18,7 +18,8 @@ import { createSeededRandom } from '../../src/random/seeded.js';
  * is conditioned on.
  */
 
-/** Rates chosen so that all three outcomes appear within a few requests. */
+/** Rates chosen so that all four outcomes appear within a few requests. */
+const RESET_RATE = 0.5;
 const TIMEOUT_RATE = 0.5;
 const ERROR_RATE = 0.9;
 
@@ -90,6 +91,7 @@ async function startSeededProxy(target: string, seed: string): Promise<SeededPro
   const { port } = await listen(
     createProxyServer({
       target,
+      resetRate: RESET_RATE,
       timeoutRate: TIMEOUT_RATE,
       errorRate: ERROR_RATE,
       timeoutMs: TIMEOUT_MS,
@@ -110,11 +112,19 @@ async function startSeededProxy(target: string, seed: string): Promise<SeededPro
  * A response reaching the client and the proxy reporting it are two different
  * moments, so each request is waited out completely before the next is sent.
  * That is what makes the sequence a sequence rather than an interleaving.
+ *
+ * A request the proxy resets never becomes a response at all, so the rejection
+ * is swallowed here: the outcome the proxy reported is what is being collected,
+ * and what the transport failure was called on this platform is not.
  */
 async function outcomesOf(proxy: SeededProxy, count: number): Promise<RequestOutcome[]> {
   for (let index = 0; index < count; index += 1) {
-    const response = await fetch(`${proxy.baseUrl}/api/item/${index}`);
-    await response.text();
+    try {
+      const response = await fetch(`${proxy.baseUrl}/api/item/${index}`);
+      await response.text();
+    } catch {
+      // Expected for a reset request; see above.
+    }
 
     const deadline = Date.now() + WAIT_TIMEOUT_MS;
 
@@ -155,26 +165,35 @@ describe('a seeded proxy', () => {
     expect(await outcomesOf(checkout, 8)).not.toEqual(await outcomesOf(other, 8));
   }, 30_000);
 
-  it('draws the timeout decision first and the error decision only after it declines', async () => {
+  it('draws reset, then timeout, then error, taking each only after the last declined', async () => {
     const target = await startUpstream();
     const proxy = await startSeededProxy(target, 'checkout-test');
 
-    // Read straight off the pinned generator output at these rates:
+    // Read straight off the pinned generator output at these rates
+    // (resetRate 0.5, timeoutRate 0.5, errorRate 0.9):
     //
-    //   0.9149 -> no timeout, 0.9164 -> no error  => forwarded (two draws)
-    //   0.4264 -> timeout                         => timeout   (one draw)
-    //   0.9252 -> no timeout, 0.5844 -> error     => error
-    //   0.9667 -> no timeout, 0.9313 -> no error  => forwarded
+    //   1: 0.9149 no reset, 0.9164 no timeout, 0.4264 error => error   (3 draws)
+    //   2: 0.9252 no reset, 0.5844 no timeout, 0.9667 none  => forward (3 draws)
+    //   3: 0.9313 no reset, 0.0143 timeout                  => timeout (2 draws)
+    //   4: 0.5000 reset                                     => reset   (1 draw)
+    //   5: 0.1050 reset                                     => reset   (1 draw)
+    //   6: 0.6728 no reset, 0.2700 timeout                  => timeout (2 draws)
     //
-    // The second request proves both halves of the ordering. It sees the third
-    // value, so the first request must have taken exactly two draws; and it is
-    // timed out by a value that the error rate of 0.9 would also have selected,
-    // so the timeout decision is the one that saw it first.
-    expect(await outcomesOf(proxy, 4)).toEqual([
-      'forwarded',
-      'injected:timeout',
+    // Every part of the ordering is pinned by which value each request lands
+    // on. The fourth and fifth requests are reset by values the timeout rate
+    // would also have selected, so the reset decision is the one that saw them
+    // first; each takes a single value and the sixth follows immediately on the
+    // next, so a reset consumes exactly one draw and neither later decision is
+    // consulted for it. The third and sixth are timed out by values the error
+    // rate of 0.9 would also have taken, so the timeout decision outranks the
+    // error decision and stops at its own draw.
+    expect(await outcomesOf(proxy, 6)).toEqual([
       'injected:error',
       'forwarded',
+      'injected:timeout',
+      'connection:reset',
+      'connection:reset',
+      'injected:timeout',
     ]);
   }, 30_000);
 
@@ -185,12 +204,15 @@ describe('a seeded proxy', () => {
     const target = await startUpstream();
     const proxy = await startSeededProxy(target, 'checkout-test');
 
-    // Which is emphatically not what the seed asks for.
-    expect(await outcomesOf(proxy, 4)).toEqual([
-      'forwarded',
-      'injected:timeout',
+    // Which is emphatically not what the seed asks for: reading Math.random
+    // would reset every one of these.
+    expect(await outcomesOf(proxy, 6)).toEqual([
       'injected:error',
       'forwarded',
+      'injected:timeout',
+      'connection:reset',
+      'connection:reset',
+      'injected:timeout',
     ]);
   }, 30_000);
 });
@@ -199,7 +221,7 @@ describe('a proxy without a random function', () => {
   it('keeps the rate semantics it has always had', async () => {
     const target = await startUpstream();
     const { port } = await listen(
-      createProxyServer({ target, errorRate: 1, errorStatus: 503, timeoutRate: 0 }),
+      createProxyServer({ target, errorRate: 1, errorStatus: 503, timeoutRate: 0, resetRate: 0 }),
     );
 
     const response = await fetch(`http://127.0.0.1:${port}/api/users`);
@@ -208,7 +230,7 @@ describe('a proxy without a random function', () => {
     await expect(response.text()).resolves.toBe('Chaos Proxy injected error');
   }, 30_000);
 
-  it('forwards everything when both rates are 0', async () => {
+  it('forwards everything when every rate is 0', async () => {
     const target = await startUpstream();
     const { port } = await listen(createProxyServer({ target }));
 

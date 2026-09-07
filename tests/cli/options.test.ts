@@ -62,6 +62,8 @@ describe('parseCliArgs', () => {
       '0.1',
       '--timeout',
       '3000',
+      '--reset-rate',
+      '0.05',
     ]);
 
     expect(command.port).toBe(4100);
@@ -72,7 +74,27 @@ describe('parseCliArgs', () => {
       errorStatus: 503,
       timeoutRate: 0.1,
       timeoutMs: 3000,
+      resetRate: 0.05,
     });
+  });
+
+  it('reads --reset-rate on its own, leaving every other chaos option absent', () => {
+    const command = parseRun(['--target', TARGET, '--reset-rate', '0.25']);
+
+    expect(command.chaos).toEqual({ resetRate: 0.25 });
+  });
+
+  it('keeps an explicit --reset-rate 0, which is a value rather than an omission', () => {
+    const command = parseRun(['--target', TARGET, '--reset-rate', '0']);
+
+    // The difference matters: absent lets a config file decide, `0` overrides
+    // it and switches resets off everywhere.
+    expect(command.chaos).toEqual({ resetRate: 0 });
+    expect('resetRate' in command.chaos).toBe(true);
+  });
+
+  it('does not offer a short alias for --reset-rate', () => {
+    expect(() => parseCliArgs(['--target', TARGET, '-r', '0.5'])).toThrow(CliError);
   });
 
   it('leaves flags that were not given off entirely, so config or core defaults apply', () => {
@@ -146,6 +168,8 @@ describe('parseCliArgs', () => {
     ['--error-status', 'five hundred'],
     ['--timeout-rate', 'abc'],
     ['--timeout', 'soon'],
+    ['--reset-rate', 'often'],
+    ['--reset-rate', ''],
   ])('rejects a %s of %j as not a number', (flag, value) => {
     expect(() => parseCliArgs(['--target', TARGET, flag, value])).toThrow(CliError);
     expect(() => parseCliArgs(['--target', TARGET, flag, value])).toThrow(flag);
@@ -157,6 +181,7 @@ describe('parseCliArgs', () => {
     ['--error-rate', '5'],
     ['--latency=-1', ''],
     ['--error-status', '200'],
+    ['--reset-rate', '5'],
   ])('leaves an out-of-range %s%j to the proxy core', (flag, value) => {
     const argv = value === '' ? ['--target', TARGET, flag] : ['--target', TARGET, flag, value];
 
@@ -201,6 +226,17 @@ describe('parseCliArgs', () => {
   });
 });
 
+describe('HELP_TEXT connection resets', () => {
+  it('documents --reset-rate and what it does', () => {
+    expect(HELP_TEXT).toContain('--reset-rate <0-1>');
+    expect(HELP_TEXT).toContain('Probability of abruptly resetting the client');
+  });
+
+  it('states where the reset decision sits in the chaos order', () => {
+    expect(HELP_TEXT).toContain('latency delay, then connection reset, then timeout, then error');
+  });
+});
+
 describe('inFlagTerms', () => {
   it.each([
     ['Invalid errorRate 5: expected a number.', 'Invalid --error-rate 5: expected a number.'],
@@ -214,6 +250,12 @@ describe('inFlagTerms', () => {
     const message = 'Unsupported proxy target protocol "ftp:" in "ftp://example.com".';
 
     expect(inFlagTerms(message)).toBe(message);
+  });
+
+  it('reports a resetRate complaint as --reset-rate', () => {
+    expect(inFlagTerms('Invalid resetRate 5: expected a number between 0 and 1 inclusive.')).toBe(
+      'Invalid --reset-rate 5: expected a number between 0 and 1 inclusive.',
+    );
   });
 
   it('never edits a value quoted inside the message', () => {

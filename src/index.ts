@@ -3,15 +3,15 @@
  *
  * The proxy core can forward HTTP traffic to a target API, inject a fixed
  * artificial latency, answer a share of requests with a synthetic HTTP error,
- * and hold a share of requests open until they hit a synthetic timeout. Chaos
- * is the same for every request unless a `resolveChaos` hook is supplied, which
- * lets a caller vary it per request without the core knowing anything about
- * where those decisions come from.
+ * hold a share of requests open until they hit a synthetic timeout, and destroy
+ * the client connection of a share of requests outright. Chaos is the same for
+ * every request unless a `resolveChaos` hook is supplied, which lets a caller
+ * vary it per request without the core knowing anything about where those
+ * decisions come from.
  *
  * It is driven either from here or from the `chaos-proxy` command line, which
  * is a consumer of this API and translates its YAML config — defaults plus
- * ordered endpoint rules — into exactly such a hook. Remaining chaos behaviour
- * (connection failures) is added in later features.
+ * ordered endpoint rules — into exactly such a hook.
  *
  * That command line also has built-in `--preset` names for common failure
  * scenarios. They are deliberately not exported: a preset is a block of these
@@ -21,7 +21,9 @@
  *
  * The proxy prints nothing on its own. An optional `onRequestComplete` hook
  * reports what happened to each completed request, and the command line is what
- * turns those facts into the lines it prints.
+ * turns those facts into the lines it prints. A request whose connection was
+ * reset has no status code, so the event reports `null` rather than inventing
+ * one.
  *
  * Chaos decisions use `Math.random` unless an optional `random` function is
  * supplied, which makes a run as reproducible as that function is. The command
