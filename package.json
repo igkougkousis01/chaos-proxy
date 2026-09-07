@@ -1,0 +1,67 @@
+{
+  "name": "chaos-proxy",
+  "version": "0.0.0",
+  "description": "A local developer proxy that deliberately degrades communication between an application and an API, so you can test resilience.",
+  "keywords": [
+    "chaos-engineering",
+    "proxy",
+    "resilience",
+    "testing",
+    "latency",
+    "cli",
+    "developer-tools"
+  ],
+  "license": "MIT",
+  "author": "igkougkousis01",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "chaos-proxy": "./dist/cli.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=22.12"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/igkougkousis01/chaos-proxy.git"
+  },
+  "bugs": {
+    "url": "https://github.com/igkougkousis01/chaos-proxy/issues"
+  },
+  "homepage": "https://github.com/igkougkousis01/chaos-proxy#readme",
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "dev": "tsx src/cli.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^22.20.1",
+    "eslint": "^10.10.0",
+    "eslint-config-prettier": "^10.1.8",
+    "prettier": "^3.9.6",
+    "tsx": "^4.23.13",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.69.0",
+    "vitest": "^5.0.0"
+  }
+}
