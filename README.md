@@ -13,8 +13,43 @@ A local developer tool for testing how an application behaves when its API misbe
 Chaos Proxy sits between an application and an API and deliberately degrades that connection, so
 that loading states, retries, error handling, and timeout behaviour can be exercised locally.
 
-See [docs/project-overview.md](docs/project-overview.md) for the full scope and planned
-capabilities.
+## Quickstart
+
+The package is not on npm yet, so the CLI runs from a clone
+([full install instructions](#install)):
+
+```bash
+git clone https://github.com/igkougkousis01/chaos-proxy.git
+cd chaos-proxy && npm install && npm run build
+```
+
+Point it at the API you want to degrade:
+
+```bash
+node dist/cli.js --target http://localhost:3000 --preset flaky-api
+```
+
+```text
+Chaos Proxy listening on http://127.0.0.1:4000
+Target: http://localhost:3000
+Preset: flaky-api
+Error injection: 25% -> 503
+Press Ctrl+C to stop.
+```
+
+Send requests to `http://127.0.0.1:4000` instead of your upstream. One in four now fails with
+`503`, and every request prints a line saying what happened to it. `Ctrl+C` stops the proxy,
+letting requests in flight finish.
+
+Three things worth knowing before anything else:
+
+- `--preset` covers the common scenarios, so nothing has to be memorised — see [Presets](#presets).
+- A `chaos.yml` in the directory you run from is [loaded automatically](#conventional-config-file),
+  with no flag at all.
+- `--print-config` shows [exactly what a run would do](#inspecting-the-configuration) without
+  starting anything, and `--seed` makes a run [repeatable](#reproducible-runs).
+
+After `npm link` (below), every command here is `chaos-proxy` rather than `node dist/cli.js`.
 
 ## Requirements
 
@@ -51,6 +86,7 @@ chaos-proxy --target http://localhost:3000
 ```text
 Chaos Proxy listening on http://127.0.0.1:4000
 Target: http://localhost:3000
+Press Ctrl+C to stop.
 12:41:03 GET    /api/users -> 200 42ms forwarded
 ```
 
@@ -71,6 +107,7 @@ Chaos Proxy listening on http://127.0.0.1:4000
 Target: http://localhost:3000
 Latency: 500ms
 Error injection: 20% -> 503
+Press Ctrl+C to stop.
 12:41:12 GET    /api/profile -> 200 548ms forwarded latency:+500ms
 12:41:15 POST   /api/orders -> 503 520ms injected:error latency:+500ms
 ```
@@ -97,7 +134,7 @@ never reachable from the rest of the network. That is deliberate and not configu
 | `--timeout <ms>`           | `30000`       | How long a timed-out request is held before it gets a `504`.    |
 | `--reset-rate <0-1>`       | `0`           | Fraction of requests whose client connection is abruptly reset. |
 | `--seed <value>`           |               | Make chaos decisions deterministic, for reproducible runs.      |
-| `--quiet`                  |               | Print nothing but errors.                                       |
+| `--quiet`                  |               | Suppress informational output; errors still print.              |
 | `--print-config`           |               | Print the resolved configuration and exit.                      |
 | `-h`, `--help`             |               | Print usage and exit.                                           |
 | `-v`, `--version`          |               | Print the package version and exit.                             |
@@ -105,9 +142,72 @@ never reachable from the rest of the network. That is deliberate and not configu
 `--target` is required unless the config file supplies it. `--config` defaults to `./chaos.yml`
 when that file exists — see [Conventional config file](#conventional-config-file).
 
-Invalid values are rejected before the server starts, with a message naming the option — they are
-never silently clamped. A port that is already in use is reported as such rather than as a stack
-trace.
+There are no short aliases beyond `-h` and `-v`. `-t` and `-p` would save four characters at the
+cost of a command line nobody can read over someone's shoulder.
+
+### Startup summary
+
+Starting the proxy prints what this run is pointed at, then what it will do to a request, then how
+to stop it:
+
+```text
+Chaos Proxy listening on http://127.0.0.1:4000
+Target: http://localhost:3000
+Config: /home/you/project/chaos.yml
+Preset: flaky-api
+Seed: checkout-test
+Latency: 250ms
+Error injection: 25% -> 503
+Timeout injection: 10% after 3000ms
+Connection resets: 5%
+Rules: 2
+Press Ctrl+C to stop.
+```
+
+**Only the lines that apply are printed.** `Config`, `Preset`, `Seed` and `Rules` appear when there
+is one, and a chaos line appears only when that chaos is switched on: a run with no timeouts says
+nothing about timeouts rather than reporting `0%`. The target and the address it is listening on
+are always there, and the stop hint is always last.
+
+The chaos lines describe what a request no rule matches receives, with every layer already
+applied — so `--preset flaky-api --error-rate 0` names the preset and then reports no error
+injection at all, because none happens. Per-rule settings stay in the file; `Rules: 2` says how
+many there are, and [`--print-config`](#inspecting-the-configuration) shows what each one does.
+
+`--quiet` suppresses all of it, including the stop hint.
+
+### Errors
+
+A mistake gets a concise problem and, where there is something useful to say, one line saying what
+to do about it. Both go to stderr, and the exit code is non-zero:
+
+```text
+chaos-proxy: Missing required target.
+Provide --target <url>, or set "target" in ./chaos.yml.
+```
+
+```text
+chaos-proxy: Invalid --error-rate 2.
+Expected a number between 0 and 1 inclusive.
+```
+
+```text
+chaos-proxy: Unknown option --erro-rate.
+Run `chaos-proxy --help` for usage.
+```
+
+```text
+chaos-proxy: Config file not found: /home/you/project/staging.yml
+```
+
+Values are rejected before the server starts, named by the flag that carried them, and never
+silently clamped. A port that is already in use is reported as such. None of these produce a stack
+trace — they are expected outcomes rather than defects, and an unexpected one still shows its
+trace as it should.
+
+`Run \`chaos-proxy --help\` for usage.` is added only where the help would actually help: a
+mistyped flag or a stray argument. A problem inside a config file, or a port that is taken, gets
+the line that fits it instead.
 
 ### Request output
 
@@ -137,82 +237,14 @@ Query strings are left out, and so are headers, bodies and anything else that co
 or a cookie into a terminal. A request whose client disconnects before the response completes
 prints nothing rather than a status it never received.
 
-`--quiet` turns off informational output — the startup summary, these lines, and the shutdown
-notice. Errors still go to stderr, and `--help`, `--version` and
+`--quiet` turns off informational output — the startup summary, the stop hint, these lines, and
+the shutdown notice. Errors still go to stderr, and `--help`, `--version` and
 [`--print-config`](#inspecting-the-configuration) still print: it silences what Chaos Proxy
 volunteers, not what it was asked for by name.
 
 ```bash
 chaos-proxy --target http://localhost:3000 --quiet
 ```
-
-## Proxy core
-
-The forwarding layer is also available programmatically, and the CLI is a consumer of it.
-`createProxyServer` returns a standard Node.js `http.Server`, so it is started and stopped like
-any other:
-
-```ts
-import { createProxyServer } from 'chaos-proxy';
-
-const server = createProxyServer({ target: 'http://localhost:5000' });
-
-server.listen(4000);
-// GET http://localhost:4000/api/users?page=2
-//   -> GET http://localhost:5000/api/users?page=2
-```
-
-It forwards the request method, path, query string, body, and headers upstream (rewriting `Host`
-to the target), and streams the upstream status, headers, and body back to the client. `http:`
-and `https:` targets are both supported; anything else is rejected when the server is created. If
-the target cannot be reached, the client receives `502 Bad Gateway`.
-
-The local proxy listener itself is plain HTTP.
-
-### Request completion events
-
-The proxy core prints nothing. Pass `onRequestComplete` to be told what happened to each request
-that completed:
-
-```ts
-import { createProxyServer } from 'chaos-proxy';
-import type { RequestLogEvent } from 'chaos-proxy';
-
-const server = createProxyServer({
-  target: 'http://localhost:5000',
-  onRequestComplete: (event: RequestLogEvent) => {
-    // { method: 'GET', pathname: '/api/users', statusCode: 200,
-    //   durationMs: 42.13, outcome: 'forwarded', latencyMs: 0 }
-  },
-});
-```
-
-It is called exactly once per request, after the response has completed, and never for a request
-whose response was cut short. `durationMs` is measured on a monotonic clock and left unrounded;
-formatting it — and the timestamp next to it — is the caller's job. This is exactly how the CLI's
-request output is implemented, so the core never learns what a terminal is.
-
-`statusCode` is `number | null`. It is `null` only for a `connection:reset`, which received no
-HTTP response at all; every other outcome carries the status the client was actually sent.
-
-### Per-request chaos
-
-Chaos is the same for every request unless you pass a `resolveChaos` hook, which is called once
-per request and whose result is layered over the static options:
-
-```ts
-const server = createProxyServer({
-  target: 'http://localhost:5000',
-  latencyMs: 100,
-  resolveChaos: (request) =>
-    request.url?.startsWith('/api/payments/') === true ? { errorRate: 1, errorStatus: 503 } : {},
-});
-```
-
-Payments now fail, everything else is forwarded, and both still wait 100 ms — a field the hook
-leaves out keeps its static value. This is exactly how `--config` is implemented: the config layer
-turns `defaults` plus ordered rules into one such hook, so the proxy core never knows YAML exists.
-The hook is optional and purely additive; static options on their own work as they always have.
 
 ## Latency injection
 
@@ -329,6 +361,7 @@ const server = createProxyServer({
 Chaos Proxy listening on http://127.0.0.1:4000
 Target: http://localhost:3000
 Connection resets: 10%
+Press Ctrl+C to stop.
 12:41:11 GET    /api/cart -> RESET 12ms connection:reset
 ```
 
@@ -387,6 +420,7 @@ Chaos Proxy listening on http://127.0.0.1:4000
 Target: http://localhost:3000
 Preset: flaky-api
 Error injection: 25% -> 503
+Press Ctrl+C to stop.
 ```
 
 | Preset          | Behaviour                                    |
@@ -406,7 +440,8 @@ be perfectly healthy while every request fails.
 An unknown name is rejected before the server starts, and the ones that exist are offered:
 
 ```text
-chaos-proxy: Unknown preset "terrible-network". Available presets: slow-api, flaky-api, timeout-heavy, backend-down.
+chaos-proxy: Unknown preset "terrible-network".
+Available presets: slow-api, flaky-api, timeout-heavy, backend-down.
 ```
 
 ### Preset precedence
@@ -467,9 +502,10 @@ chaos-proxy \
 ```text
 Chaos Proxy listening on http://127.0.0.1:4000
 Target: http://localhost:3000
-Error injection: 30% -> 500
-Timeout injection: 10% -> 30000ms
 Seed: checkout-test
+Error injection: 30% -> 500
+Timeout injection: 10% after 30000ms
+Press Ctrl+C to stop.
 ```
 
 Using the same seed, configuration, and request order produces the same chaos decision sequence.
@@ -553,8 +589,9 @@ chaos-proxy --config chaos.yml
 Chaos Proxy listening on http://127.0.0.1:4000
 Target: http://localhost:3000
 Config: /home/you/project/chaos.yml
-Rules: 2
 Latency: 100ms
+Rules: 2
+Press Ctrl+C to stop.
 ```
 
 Every request is now delayed by 100 ms, anything under `/api/payments/` fails with `503` instead
@@ -761,6 +798,74 @@ else. Environment variables and `${VAR}` interpolation, other file names, parent
 home-directory lookup, JSON and TOML config, remote config, multiple files, includes, inheritance,
 hot reload, and commands that write or migrate a config file are all unsupported.
 
+## Proxy core
+
+The forwarding layer is also available programmatically, and the CLI is a consumer of it.
+`createProxyServer` returns a standard Node.js `http.Server`, so it is started and stopped like
+any other:
+
+```ts
+import { createProxyServer } from 'chaos-proxy';
+
+const server = createProxyServer({ target: 'http://localhost:5000' });
+
+server.listen(4000);
+// GET http://localhost:4000/api/users?page=2
+//   -> GET http://localhost:5000/api/users?page=2
+```
+
+It forwards the request method, path, query string, body, and headers upstream (rewriting `Host`
+to the target), and streams the upstream status, headers, and body back to the client. `http:`
+and `https:` targets are both supported; anything else is rejected when the server is created. If
+the target cannot be reached, the client receives `502 Bad Gateway`.
+
+The local proxy listener itself is plain HTTP.
+
+### Request completion events
+
+The proxy core prints nothing. Pass `onRequestComplete` to be told what happened to each request
+that completed:
+
+```ts
+import { createProxyServer } from 'chaos-proxy';
+import type { RequestLogEvent } from 'chaos-proxy';
+
+const server = createProxyServer({
+  target: 'http://localhost:5000',
+  onRequestComplete: (event: RequestLogEvent) => {
+    // { method: 'GET', pathname: '/api/users', statusCode: 200,
+    //   durationMs: 42.13, outcome: 'forwarded', latencyMs: 0 }
+  },
+});
+```
+
+It is called exactly once per request, after the response has completed, and never for a request
+whose response was cut short. `durationMs` is measured on a monotonic clock and left unrounded;
+formatting it — and the timestamp next to it — is the caller's job. This is exactly how the CLI's
+request output is implemented, so the core never learns what a terminal is.
+
+`statusCode` is `number | null`. It is `null` only for a `connection:reset`, which received no
+HTTP response at all; every other outcome carries the status the client was actually sent.
+
+### Per-request chaos
+
+Chaos is the same for every request unless you pass a `resolveChaos` hook, which is called once
+per request and whose result is layered over the static options:
+
+```ts
+const server = createProxyServer({
+  target: 'http://localhost:5000',
+  latencyMs: 100,
+  resolveChaos: (request) =>
+    request.url?.startsWith('/api/payments/') === true ? { errorRate: 1, errorStatus: 503 } : {},
+});
+```
+
+Payments now fail, everything else is forwarded, and both still wait 100 ms — a field the hook
+leaves out keeps its static value. This is exactly how `--config` is implemented: the config layer
+turns `defaults` plus ordered rules into one such hook, so the proxy core never knows YAML exists.
+The hook is optional and purely additive; static options on their own work as they always have.
+
 ## Development
 
 ```bash
@@ -786,6 +891,9 @@ npm run dev -- --target http://localhost:3000 --latency 500
 ```
 
 ## Project status
+
+See [docs/project-overview.md](docs/project-overview.md) for the full scope and planned
+capabilities.
 
 | Area                | Status                               |
 | ------------------- | ------------------------------------ |

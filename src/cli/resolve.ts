@@ -7,7 +7,7 @@ import type { PresetName } from '../presets/index.js';
 import { assertValidTarget, resolveChaosOptions } from '../proxy/server.js';
 import type { ChaosOptions, ProxyServerOptions, ResolvedChaosOptions } from '../proxy/server.js';
 import { createSeededRandom } from '../random/seeded.js';
-import { CliError, DEFAULT_PORT, inFlagTerms } from './options.js';
+import { CliError, DEFAULT_PORT, usageErrorFrom } from './options.js';
 import type { CliCommand } from './options.js';
 
 /** One endpoint rule as it ends up applying, with every default filled in. */
@@ -108,7 +108,32 @@ function reportingUsageErrors<T>(describe: () => T): T {
     return describe();
   } catch (error) {
     if (error instanceof TypeError || error instanceof RangeError) {
-      throw new CliError(inFlagTerms(error.message));
+      throw usageErrorFrom(error.message);
+    }
+
+    throw error;
+  }
+}
+
+/**
+ * Checks the target, complaining in terms of where the value came from.
+ *
+ * The proxy core calls it "proxy target", because it cannot know whether a
+ * caller typed it, read it from a file, or made it up. Here that is known, so a
+ * target the user typed is reported as `--target` like every other flag. A
+ * target the config file supplied keeps the core's own wording: calling it
+ * `--target` would send someone to edit a flag they never used.
+ *
+ * @throws {CliError} If the target is not an absolute `http:` or `https:` URL.
+ */
+function assertValidTargetFrom(target: string, typed: boolean): void {
+  try {
+    assertValidTarget(target);
+  } catch (error) {
+    if (error instanceof TypeError) {
+      throw usageErrorFrom(
+        typed ? error.message.replace('proxy target', '--target') : error.message,
+      );
     }
 
     throw error;
@@ -179,11 +204,15 @@ export function resolveCommand(command: CliCommand): ResolvedCommand {
   const target = command.target ?? config?.target;
 
   if (target === undefined) {
-    throw new CliError(
-      loaded === undefined
-        ? 'Missing required option --target, for example --target http://localhost:3000.'
-        : `Missing target: ${loaded.path} does not set "target", so it must be given as --target http://localhost:3000.`,
-    );
+    throw loaded === undefined
+      ? new CliError(
+          'Missing required target.',
+          'Provide --target <url>, or set "target" in ./chaos.yml.',
+        )
+      : new CliError(
+          `Missing required target: ${loaded.path} does not set "target".`,
+          'Provide --target <url>, or add "target" to that file.',
+        );
   }
 
   // The two layers that beat the config file, flattened once into the single
@@ -198,7 +227,7 @@ export function resolveCommand(command: CliCommand): ResolvedCommand {
   // Checked before anything is described or started, so a configuration that
   // could not run is never printed as though it could.
   const effectiveChaos = reportingUsageErrors(() => {
-    assertValidTarget(target);
+    assertValidTargetFrom(target, command.target !== undefined);
 
     return describeEffectiveChaos(base, rules);
   });
