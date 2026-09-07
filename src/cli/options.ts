@@ -1,6 +1,8 @@
 import { parseArgs } from 'node:util';
 
 import { PORT_MAX, PORT_MIN, isValidPort } from '../config/schema.js';
+import { PRESET_HELP, PRESET_LIST, isPresetName } from '../presets/index.js';
+import type { PresetName } from '../presets/index.js';
 import type { ChaosOptions } from '../proxy/server.js';
 
 /** Port the proxy listens on when neither `--port` nor a config supplies one. */
@@ -53,6 +55,13 @@ export interface CliCommand {
   /** Chaos flags the user actually typed, and only those. */
   readonly chaos: ChaosOptions;
   /**
+   * Built-in preset named by `--preset`, if any, kept as a name rather than as
+   * the chaos it stands for: what it means is settled in `resolve.ts` alongside
+   * every other source of chaos, and the name itself is what the startup
+   * summary has to report.
+   */
+  readonly preset: PresetName | undefined;
+  /**
    * Seed given to `--seed`, if any, kept as the opaque string it was typed as.
    * Absent means chaos decisions stay ordinarily random.
    */
@@ -82,6 +91,7 @@ Options:
   --target <url>            API to forward to (http: or https:). Required
                             unless the config file supplies it.
   --config <path>           YAML config file with defaults and endpoint rules.
+  --preset <name>           Use a built-in chaos preset. See Presets below.
   --port <1-65535>          Port to listen on. Default: ${DEFAULT_PORT}.
   --latency <ms>            Fixed delay added to every request.
   --error-rate <0-1>        Fraction of requests answered with a synthetic error.
@@ -107,7 +117,14 @@ Every completed request prints one line, unless --quiet is given:
   12:41:07 POST   /api/payments/123 -> 503 510ms injected:error latency:+500ms
 
 A config file adds per-endpoint rules; the first rule whose "match" fits the
-request path wins. Flags beat config values, which beat the built-in defaults.
+request path wins.
+
+Presets:
+${PRESET_HELP}
+
+A preset is a starting point rather than a mode, so precedence runs:
+
+  explicit chaos flags  >  --preset  >  config file  >  built-in defaults
 
 Examples:
   ${CLI_NAME} --target http://localhost:3000
@@ -121,6 +138,8 @@ Examples:
     --target http://localhost:3000 \\
     --error-rate 0.5 \\
     --seed checkout-test
+
+  ${CLI_NAME} --target http://localhost:3000 --preset flaky-api
 
   ${CLI_NAME} --config chaos.yml`;
 
@@ -202,6 +221,23 @@ function toPort(raw: string): number {
   return value;
 }
 
+/**
+ * Reads `--preset`.
+ *
+ * An unrecognised name is a mistake worth naming the alternatives for: presets
+ * exist so that nothing has to be memorised, so a wrong guess should not send
+ * anyone to `--help` to find out what the right ones were.
+ *
+ * @throws {CliError} If the value is empty or is not a built-in preset.
+ */
+function toPreset(raw: string): PresetName {
+  if (!isPresetName(raw)) {
+    throw new CliError(`Unknown preset ${JSON.stringify(raw)}. Available presets: ${PRESET_LIST}.`);
+  }
+
+  return raw;
+}
+
 /** Reads an optional numeric flag, leaving it absent when it was not given. */
 function optionalNumber(raw: string | boolean | undefined, flag: string): number | undefined {
   return typeof raw === 'string' ? toNumber(flag, raw) : undefined;
@@ -227,6 +263,7 @@ export function parseCliArgs(argv: readonly string[]): ParsedCli {
       options: {
         target: { type: 'string' },
         config: { type: 'string' },
+        preset: { type: 'string' },
         port: { type: 'string' },
         latency: { type: 'string' },
         'error-rate': { type: 'string' },
@@ -287,6 +324,12 @@ export function parseCliArgs(argv: readonly string[]): ParsedCli {
     );
   }
 
+  const preset = values.preset;
+
+  if (preset !== undefined && typeof preset !== 'string') {
+    throw new CliError(`Invalid --preset: expected one of ${PRESET_LIST}.`);
+  }
+
   const latencyMs = optionalNumber(values.latency, 'latency');
   const errorRate = optionalNumber(values['error-rate'], 'error-rate');
   const errorStatus = optionalNumber(values['error-status'], 'error-status');
@@ -310,6 +353,7 @@ export function parseCliArgs(argv: readonly string[]): ParsedCli {
       port: typeof values.port === 'string' ? toPort(values.port) : undefined,
       target,
       chaos,
+      preset: preset === undefined ? undefined : toPreset(preset),
       seed,
       quiet: values.quiet === true,
     },

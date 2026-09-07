@@ -224,3 +224,64 @@ describe('inFlagTerms', () => {
     );
   });
 });
+
+describe('parseCliArgs --preset', () => {
+  it('reports no preset when none was asked for', () => {
+    expect(parseRun(['--target', TARGET]).preset).toBeUndefined();
+  });
+
+  it.each(['slow-api', 'flaky-api', 'timeout-heavy', 'backend-down'])('accepts %s', (name) => {
+    expect(parseRun(['--target', TARGET, '--preset', name]).preset).toBe(name);
+  });
+
+  it('accepts the --preset=value form', () => {
+    expect(parseRun(['--target', TARGET, '--preset=flaky-api']).preset).toBe('flaky-api');
+  });
+
+  // The preset is carried as a name, not as the chaos it stands for: what it
+  // means is settled in `resolve.ts`, where everything else is.
+  it('leaves the chaos block untouched, so precedence is decided in one place', () => {
+    const command = parseRun(['--target', TARGET, '--preset', 'flaky-api']);
+
+    expect(command.chaos).toEqual({});
+  });
+
+  it('keeps an explicit flag alongside the preset name', () => {
+    const command = parseRun(['--target', TARGET, '--preset', 'flaky-api', '--error-rate', '0.5']);
+
+    expect(command.preset).toBe('flaky-api');
+    expect(command.chaos).toEqual({ errorRate: 0.5 });
+  });
+
+  it('rejects an unknown preset and offers the ones that exist', () => {
+    const argv = ['--target', TARGET, '--preset', 'terrible-network'];
+
+    expect(() => parseCliArgs(argv)).toThrow(CliError);
+    expect(() => parseCliArgs(argv)).toThrow(
+      'Unknown preset "terrible-network". Available presets: slow-api, flaky-api, timeout-heavy, backend-down.',
+    );
+  });
+
+  it.each(['', 'SLOW-API', 'slow', 'flaky'])('rejects %j', (name) => {
+    expect(() => parseCliArgs(['--target', TARGET, '--preset', name])).toThrow(/preset/);
+  });
+});
+
+describe('HELP_TEXT presets', () => {
+  it('documents the option', () => {
+    expect(HELP_TEXT).toContain('--preset <name>');
+  });
+
+  it.each(['slow-api', 'flaky-api', 'timeout-heavy', 'backend-down'])(
+    'lists %s with what it does',
+    (name) => {
+      expect(HELP_TEXT).toContain(name);
+    },
+  );
+
+  it('states where a preset sits in the precedence order', () => {
+    expect(HELP_TEXT).toContain(
+      'explicit chaos flags  >  --preset  >  config file  >  built-in defaults',
+    );
+  });
+});

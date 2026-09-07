@@ -5,8 +5,8 @@ A local developer tool for testing how an application behaves when its API misbe
 > **Status: under development.** Chaos Proxy runs from the command line and can forward HTTP
 > traffic to a target API, inject a fixed artificial latency, inject synthetic HTTP errors, and
 > inject synthetic timeouts — globally, or per endpoint through a YAML config file — printing one
-> line per request as it goes. `--seed` makes a run reproducible. Connection failures do not exist
-> yet.
+> line per request as it goes. Named presets cover the common scenarios, and `--seed` makes a run
+> reproducible. Connection failures do not exist yet.
 
 Chaos Proxy sits between an application and an API and deliberately degrades that connection, so
 that loading states, retries, error handling, and timeout behaviour can be exercised locally.
@@ -86,6 +86,7 @@ never reachable from the rest of the network. That is deliberate and not configu
 | -------------------------- | ---------- | --------------------------------------------------------------- |
 | `--target <url>`           | _required_ | API to forward to. Must be an absolute `http:` or `https:` URL. |
 | `--config <path>`          |            | YAML config file with defaults and endpoint rules.              |
+| `--preset <name>`          |            | Use a built-in chaos preset. See [Presets](#presets).           |
 | `--port <1-65535>`         | `4000`     | Port to listen on, on `127.0.0.1`.                              |
 | `--latency <ms>`           | `0`        | Fixed delay added to every request.                             |
 | `--error-rate <0-1>`       | `0`        | Fraction of requests answered with a synthetic error.           |
@@ -307,6 +308,83 @@ next timer tick, without waiting.
 Random or ranged timeout durations, jitter, and dropped or reset TCP connections are not
 supported. Per-endpoint timeouts are configured with a [config file](#config-file).
 
+## Presets
+
+Reaching for the tool to see what a flaky API does to an application should not start with
+remembering that "flaky" means `--error-rate 0.25 --error-status 503`. A preset is a named
+starting point for one common scenario:
+
+```bash
+chaos-proxy \
+  --target http://localhost:3000 \
+  --preset flaky-api
+```
+
+```text
+Chaos Proxy listening on http://127.0.0.1:4000
+Target: http://localhost:3000
+Preset: flaky-api
+Error injection: 25% -> 503
+```
+
+| Preset          | Behaviour                                    |
+| --------------- | -------------------------------------------- |
+| `slow-api`      | Adds 1000 ms latency to every request        |
+| `flaky-api`     | 25% of requests fail with `503`              |
+| `timeout-heavy` | 30% of requests are held 3000 ms, then `504` |
+| `backend-down`  | 100% of requests fail with `503`             |
+
+`backend-down` is a synthetic failure like any other: the proxy answers `503` itself, and the
+target is never contacted. Nothing is done to the connection or to the target, so the upstream can
+be perfectly healthy while every request fails.
+
+An unknown name is rejected before the server starts, and the ones that exist are offered:
+
+```text
+chaos-proxy: Unknown preset "terrible-network". Available presets: slow-api, flaky-api, timeout-heavy, backend-down.
+```
+
+### Preset precedence
+
+```text
+explicit CLI flags  >  --preset  >  config file  >  built-in defaults
+```
+
+A preset is a base scenario rather than a mode, so a flag typed alongside it still wins:
+
+```bash
+chaos-proxy --target http://localhost:3000 --preset flaky-api --error-rate 0.5
+```
+
+Half the requests now fail, still with `503` — the flag replaced the rate and left the rest of the
+preset alone.
+
+A preset sets only the fields its scenario is about, so it never resets anything else. With a
+config file whose `defaults` set `latencyMs: 100` and `errorRate: 0.1`, adding `--preset slow-api`
+gives `latencyMs: 1000` and leaves `errorRate: 0.1` exactly where it was.
+
+**A preset sits above the whole config file, endpoint rules included.** With this file:
+
+```yaml
+rules:
+  - match: /api/payments/*
+    errorRate: 1
+```
+
+`--preset flaky-api` gives `/api/payments/*` an `errorRate` of `0.25` like everywhere else. That is
+deliberate: a preset names the scenario being tested, and a rule that outranked it would make
+`--preset backend-down` mean "the backend is down except where the file says otherwise". The
+startup summary always describes the settled values, so `--preset flaky-api --error-rate 0` names
+the preset and then reports no error injection at all.
+
+Presets change configuration and nothing else. `--preset flaky-api --seed checkout-test` is exactly
+as reproducible as any other seeded run — there is no preset-specific seed, and the per-request log
+lines are unchanged.
+
+Presets are a command-line convenience only: there is no `preset` field in the [config
+file](#config-file), no user-defined or downloaded presets, no preset files, no inheritance or
+composition, and no combining two at once.
+
 ## Reproducible runs
 
 Chaos is random, which is exactly what makes an interesting failure hard to look at twice.
@@ -467,7 +545,7 @@ to `/api/payments/123` ends up with `latencyMs: 100`, `errorRate: 0.1` and `erro
 ### Precedence overall
 
 ```text
-command-line flags  >  config file  >  built-in defaults
+command-line flags  >  --preset  >  config file  >  built-in defaults
 ```
 
 A flag you type wins over the config file, and that includes rules:
@@ -478,7 +556,8 @@ chaos-proxy --config chaos.yml --port 5000 --error-rate 0
 
 `--port 5000` overrides the file's `port`, and `--error-rate 0` switches error injection off
 everywhere — including inside a rule that sets `errorRate: 1`. The reasoning is that a flag typed
-on the spot is the more deliberate of the two.
+on the spot is the more deliberate of the two. A [preset](#presets) sits between the two, above
+everything the file says and below anything typed.
 
 Configuration is `--config` only. Environment variables, `.chaosrc`-style auto-discovery, JSON
 config, hot reload, and config includes are not supported.
@@ -518,6 +597,7 @@ npm run dev -- --target http://localhost:3000 --latency 500
 | Error injection     | Fixed status, fixed probability   |
 | Timeout injection   | Fixed duration, fixed probability |
 | Config files        | YAML, with endpoint rules         |
+| Presets             | Four built-in scenarios           |
 | Request logging     | One line per completed request    |
 | Reproducibility     | `--seed`, per request sequence    |
 | Other chaos         | Not started                       |

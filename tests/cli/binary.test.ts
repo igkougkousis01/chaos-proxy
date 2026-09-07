@@ -840,3 +840,200 @@ describe('the built CLI with --seed', () => {
     expect(cli.stderr()).toBe('');
   }, 30_000);
 });
+
+/**
+ * Starts the built CLI with a preset and waits for it to announce that preset.
+ *
+ * The startup line is the readiness signal as well as the thing under test:
+ * a preset that was accepted but never reported would leave nothing to wait on.
+ */
+async function startPresetCli(
+  target: string,
+  preset: string,
+  extraArgs: readonly string[] = [],
+): Promise<{ cli: CliProcess; baseUrl: string }> {
+  const port = await findFreePort();
+  const cli = startCli([
+    '--target',
+    target,
+    '--port',
+    String(port),
+    '--preset',
+    preset,
+    ...extraArgs,
+  ]);
+  await waitForOutput(cli, `Preset: ${preset}`);
+
+  return { cli, baseUrl: `http://127.0.0.1:${port}` };
+}
+
+describe('the built CLI with --preset', () => {
+  it('documents the option and every preset in its help', async () => {
+    const cli = startCli(['--help']);
+
+    await expect(cli.exit).resolves.toMatchObject({ code: 0 });
+
+    const help = cli.stdout();
+
+    expect(help).toContain('--preset <name>');
+    expect(help).toContain('Presets:');
+    expect(help).toContain('slow-api');
+    expect(help).toContain('flaky-api');
+    expect(help).toContain('timeout-heavy');
+    expect(help).toContain('backend-down');
+    expect(cli.stderr()).toBe('');
+  }, 20_000);
+
+  it('refuses an unknown preset and never listens', async () => {
+    const cli = startCli(['--target', 'http://127.0.0.1:1', '--preset', 'terrible-network']);
+
+    const { code } = await cli.exit;
+
+    expect(code).not.toBe(0);
+    expect(cli.stdout()).toBe('');
+    expect(cli.stderr()).toContain('Unknown preset "terrible-network"');
+    expect(cli.stderr()).toContain('slow-api, flaky-api, timeout-heavy, backend-down');
+    // An expected user mistake, not a crash.
+    expect(cli.stderr()).not.toContain('at ');
+  }, 20_000);
+
+  // One process-level check that a preset really does reach the forwarding
+  // path; which numbers each preset stands for is settled at the resolver, so
+  // the rest of them cost the suite nothing.
+  it('slows every request down under slow-api', async () => {
+    const upstream = await startUpstream();
+    const { cli, baseUrl } = await startPresetCli(upstream.origin, 'slow-api');
+
+    expect(cli.stdout()).toContain('Latency: 1000ms');
+
+    const startedAt = performance.now();
+    const response = await fetch(`${baseUrl}/api/users`);
+    const elapsed = performance.now() - startedAt;
+
+    expect(response.status).toBe(200);
+    await expect(response.text()).resolves.toBe('upstream ok');
+    // Lower bound only, with slack for timer coarseness and loaded runners.
+    expect(elapsed).toBeGreaterThanOrEqual(800);
+  }, 30_000);
+
+  it('fails every request without touching the upstream under backend-down', async () => {
+    const upstream = await startUpstream();
+    const { cli, baseUrl } = await startPresetCli(upstream.origin, 'backend-down');
+
+    expect(cli.stdout()).toContain('Error injection: 100% -> 503');
+
+    for (const path of ['/api/users', '/api/payments/123']) {
+      const response = await fetch(`${baseUrl}${path}`);
+
+      expect(response.status).toBe(503);
+      await expect(response.text()).resolves.toBe('Chaos Proxy injected error');
+    }
+
+    // The preset is a synthetic failure, not an unreachable target: the
+    // upstream is up and running and simply never hears from the proxy.
+    expect(upstream.requests).toHaveLength(0);
+
+    await waitForOutcomes(cli, 2);
+    expect(loggedOutcomes(cli)).toEqual(['injected:error', 'injected:error']);
+
+    cli.child.kill('SIGINT');
+    await expect(cli.exit).resolves.toMatchObject({ code: 0, signal: null });
+    expect(cli.stdout()).toContain('shutting down');
+  }, 30_000);
+
+  it('reports the effective chaos rather than the preset definition when a flag overrides it', async () => {
+    const upstream = await startUpstream();
+    const { cli, baseUrl } = await startPresetCli(upstream.origin, 'flaky-api', [
+      '--error-rate',
+      '0',
+    ]);
+
+    // Named as asked for, but no claim about failures that cannot happen.
+    expect(cli.stdout()).toContain('Preset: flaky-api');
+    expect(cli.stdout()).not.toContain('Error injection');
+
+    const response = await fetch(`${baseUrl}/api/users`);
+
+    expect(response.status).toBe(200);
+    await expect(response.text()).resolves.toBe('upstream ok');
+  }, 30_000);
+
+  it('says nothing about a preset when none was given', async () => {
+    const upstream = await startUpstream();
+    const { cli } = await startProxyCli(upstream.origin);
+
+    expect(cli.stdout()).not.toContain('Preset');
+  }, 30_000);
+
+  it('suppresses the preset line under --quiet, while still applying it', async () => {
+    const upstream = await startUpstream();
+    const port = await findFreePort();
+    const cli = startCli([
+      '--target',
+      upstream.origin,
+      '--port',
+      String(port),
+      '--preset',
+      'backend-down',
+      '--quiet',
+    ]);
+
+    const response = await fetchWhenListening(`http://127.0.0.1:${port}/api/users`);
+
+    expect(response.status).toBe(503);
+    await expect(response.text()).resolves.toBe('Chaos Proxy injected error');
+    expect(upstream.requests).toHaveLength(0);
+
+    // Long enough that a startup or completion line would have been written.
+    await sleep(200);
+
+    expect(cli.stdout()).toBe('');
+    expect(cli.stderr()).toBe('');
+  }, 30_000);
+});
+
+/** Drives one preset-and-seed run through `count` requests, one at a time. */
+async function runSeededPreset(target: string, count: number): Promise<SeededRun> {
+  const { cli, baseUrl } = await startPresetCli(target, 'flaky-api', ['--seed', 'checkout-test']);
+  const statuses: number[] = [];
+
+  for (let index = 0; index < count; index += 1) {
+    const response = await fetch(`${baseUrl}/api/item/${index}`);
+    await response.text();
+    statuses.push(response.status);
+    await waitForOutcomes(cli, index + 1);
+  }
+
+  const outcomes = loggedOutcomes(cli);
+
+  cli.child.kill('SIGINT');
+  await cli.exit;
+
+  return { statuses, outcomes };
+}
+
+describe('the built CLI with --preset and --seed', () => {
+  // A preset is configuration and nothing more, so a seeded run stays exactly
+  // as reproducible as it is without one. There is no preset-specific seed.
+  it('replays the same outcomes across two separate runs', async () => {
+    const upstream = await startUpstream();
+
+    const first = await runSeededPreset(upstream.origin, 6);
+    const second = await runSeededPreset(upstream.origin, 6);
+
+    expect(first.outcomes).toEqual(second.outcomes);
+    expect(first.statuses).toEqual(second.statuses);
+
+    // Pinned, so this promises which requests the preset's 25% failed rather
+    // than only that two runs agreed with each other.
+    expect(first.outcomes).toEqual([
+      'forwarded',
+      'forwarded',
+      'forwarded',
+      'injected:error',
+      'injected:error',
+      'forwarded',
+    ]);
+    expect(first.statuses).toEqual([200, 200, 200, 503, 503, 200]);
+  }, 60_000);
+});
