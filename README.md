@@ -2,9 +2,10 @@
 
 A local developer tool for testing how an application behaves when its API misbehaves.
 
-> **Status: under development.** The proxy core can forward HTTP traffic to a target API and
-> inject a fixed artificial latency. Other chaos behaviour (errors, timeouts) does not exist
-> yet, and the CLI currently only prints its name.
+> **Status: under development.** The proxy core can forward HTTP traffic to a target API, inject
+> a fixed artificial latency, and inject synthetic HTTP errors. Other chaos behaviour (timeouts,
+> connection failures) does not exist yet, and the CLI currently only prints its name — every
+> option below is programmatic only.
 
 ## What it will do
 
@@ -57,6 +58,36 @@ Omitting `latencyMs` (or setting it to `0`) means no artificial delay. Negative,
 infinite values are rejected with a `RangeError` when the server is created — they are never
 silently clamped.
 
+## Error injection
+
+`errorRate` is the probability, from `0` to `1`, that a request is answered with a synthetic HTTP
+error instead of being forwarded. `errorStatus` chooses the status code and defaults to `500`.
+Like `latencyMs`, both are programmatic only — there are no CLI flags for them yet.
+
+```ts
+const server = createProxyServer({
+  target: 'http://localhost:5000',
+  errorRate: 0.2, // roughly 1 request in 5 fails
+  errorStatus: 503,
+});
+```
+
+An injected error is decided per request and answered by the proxy itself: no upstream connection
+is opened and no request body is forwarded. The client receives the configured status with the
+plain-text body `Chaos Proxy injected error`.
+
+The decision happens **after** any `latencyMs` delay, so `latencyMs: 500` with `errorRate: 1`
+makes every request wait roughly 500 ms and then fail — a slow failure, like a real one. If the
+client disconnects while the delay is still running, nothing is decided and nothing is sent.
+
+Omitting `errorRate` (or setting it to `0`) means requests are never failed. Rates outside
+`0`-`1`, `NaN`, and infinities are rejected with a `RangeError` when the server is created, as is
+an `errorStatus` that is not an integer from `400` to `599`.
+
+Each request is decided independently. Choosing between several status codes, weighting them,
+scoping errors to particular endpoints or methods, and configuring any of this from the CLI or a
+config file are not supported.
+
 ## Requirements
 
 - Node.js >= 22.12
@@ -88,13 +119,14 @@ node dist/cli.js
 
 ## Project status
 
-| Area                | Status      |
-| ------------------- | ----------- |
-| Project scaffolding | Done        |
-| CLI entry point     | Placeholder |
-| HTTP forwarding     | Done        |
-| Latency injection   | Fixed delay |
-| Other chaos         | Not started |
+| Area                | Status       |
+| ------------------- | ------------ |
+| Project scaffolding | Done         |
+| CLI entry point     | Placeholder  |
+| HTTP forwarding     | Done         |
+| Latency injection   | Fixed delay  |
+| Error injection     | Programmatic |
+| Other chaos         | Not started  |
 
 ## License
 

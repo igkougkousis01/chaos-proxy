@@ -1,8 +1,9 @@
 /**
  * Public entry point for the Chaos Proxy package.
  *
- * The proxy core can forward HTTP traffic to a target API and inject a fixed
- * artificial latency. Remaining chaos behaviour (errors, timeouts) and CLI
+ * The proxy core can forward HTTP traffic to a target API, inject a fixed
+ * artificial latency, and answer a share of requests with a synthetic HTTP
+ * error. Remaining chaos behaviour (timeouts, connection failures) and CLI
  * configuration are added in later features.
  */
 
