@@ -1,5 +1,9 @@
 # Chaos Proxy
 
+[![CI](https://github.com/igkougkousis01/chaos-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/igkougkousis01/chaos-proxy/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Node.js >= 22.12](https://img.shields.io/badge/node-%3E%3D22.12-brightgreen.svg)](#requirements)
+
 A local developer tool for testing how an application behaves when its API misbehaves.
 
 > **Status: under development.** Chaos Proxy runs from the command line and can forward HTTP
@@ -56,9 +60,15 @@ After `npm link` (below), every command here is `chaos-proxy` rather than `node 
 - Node.js >= 22.12
 - npm
 
+CI runs the test suite on Node 22 and 24, and installs and drives the packed package on Linux and
+macOS. Windows is not tested and is not claimed either way — it may well work, but nothing here
+has checked.
+
 ## Install
 
-The package is not published yet, so install it from a clone:
+### From source
+
+The package is not published to npm yet, so install it from a clone:
 
 ```bash
 git clone https://github.com/igkougkousis01/chaos-proxy.git
@@ -74,6 +84,14 @@ run directly:
 ```bash
 node dist/cli.js --target http://localhost:3000
 ```
+
+### From npm
+
+Not available yet. There is no `chaos-proxy` package on the registry to install, so do not expect
+`npm install -g chaos-proxy` to give you this tool. When the first release is published, this
+section will say so and the command will be here — until then, the clone above is the only way to
+get it. See [docs/release-checklist.md](docs/release-checklist.md) for where publishing sits in the
+release process.
 
 ## Usage
 
@@ -872,17 +890,26 @@ The hook is optional and purely additive; static options on their own work as th
 npm install
 ```
 
-| Script                 | Description                      |
-| ---------------------- | -------------------------------- |
-| `npm run dev`          | Run the CLI from source          |
-| `npm run build`        | Compile TypeScript to `dist/`    |
-| `npm test`             | Run the test suite once          |
-| `npm run test:watch`   | Run tests in watch mode          |
-| `npm run typecheck`    | Type-check without emitting      |
-| `npm run lint`         | Lint with ESLint                 |
-| `npm run lint:fix`     | Lint and apply fixable issues    |
-| `npm run format`       | Format with Prettier             |
-| `npm run format:check` | Check formatting without writing |
+| Script                  | Description                                                  |
+| ----------------------- | ------------------------------------------------------------ |
+| `npm run check`         | The whole gate CI runs: typecheck, lint, format, test, build |
+| `npm run package:smoke` | Pack, install into a throwaway project, and drive the result |
+| `npm run dev`           | Run the CLI from source                                      |
+| `npm run build`         | Compile TypeScript to `dist/`                                |
+| `npm test`              | Run the test suite once                                      |
+| `npm run test:watch`    | Run tests in watch mode                                      |
+| `npm run typecheck`     | Type-check without emitting                                  |
+| `npm run lint`          | Lint with ESLint                                             |
+| `npm run lint:fix`      | Lint and apply fixable issues                                |
+| `npm run format`        | Format with Prettier                                         |
+| `npm run format:check`  | Check formatting without writing                             |
+
+`npm run package:smoke` is the one that cannot be replaced by the test suite: it packs the package,
+installs the tarball into a temporary project outside this repository, and then drives the
+installed copy — the CLI as a child process, `createProxyServer` as an import, and a real request
+forwarded through a real proxy. Everything that only breaks between "works in the repo" and "works
+once installed" is caught there. Run it for any change to `package.json`, the build, the `bin`
+entry or the `exports` map.
 
 `npm run dev` takes the same flags as the built CLI:
 
@@ -910,6 +937,17 @@ capabilities.
 | Request logging     | One line per completed request       |
 | Reproducibility     | `--seed`, per request sequence       |
 | Other chaos         | Not started                          |
+
+## Contributing and support
+
+| Document                                               | What it covers                                    |
+| ------------------------------------------------------ | ------------------------------------------------- |
+| [CONTRIBUTING.md](CONTRIBUTING.md)                     | Setting up, the checks to run, what is in scope   |
+| [SUPPORT.md](SUPPORT.md)                               | Where to report bugs and ask questions            |
+| [SECURITY.md](SECURITY.md)                             | Reporting a vulnerability — not the issue tracker |
+| [CHANGELOG.md](CHANGELOG.md)                           | What has changed                                  |
+| [docs/release-checklist.md](docs/release-checklist.md) | How a release is cut                              |
+| [LICENSE](LICENSE)                                     | MIT                                               |
 
 ## License
 

@@ -1,0 +1,116 @@
+name: Release
+
+# This workflow has exactly two modes, and which one it is in follows from the
+# trigger rather than from an input:
+#
+#   push of a `v*` tag  -> a real release: the tag is checked against the
+#                          manifest version, and a GitHub Release is created.
+#   workflow_dispatch    -> a dry run: everything is built, packed and verified,
+#                          and the tarball is uploaded as a workflow artifact,
+#                          but no GitHub Release is created and nothing is
+#                          published. It exists to exercise this workflow, and
+#                          to get a packed artifact, without cutting a release.
+#
+# `workflow_dispatch` takes no version input on purpose. An input would be a
+# second place a version could be stated, next to the tag and the manifest, and
+# the whole point of the verifier below is that there is only one answer to
+# "which version is this". A dry run does not need to name a version, and a real
+# release already has one.
+#
+# Nothing here fires on an ordinary push to a branch.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A tag build is the record of a release, so it is never cancelled by a later
+# run.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build release artifact
+    runs-on: ubuntu-latest
+
+    # The only elevated permission in the repository, and only for the step that
+    # creates the GitHub Release. No npm token is used or required: publishing to
+    # the registry is a deliberate manual step, documented in
+    # docs/release-checklist.md.
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Before anything is built or packed, so a tag that disagrees with the
+      # manifest fails here rather than on a published artifact.
+      #
+      # Skipped when there is no tag to check, which is the only reason a manual
+      # run from a branch does not fail: `GITHUB_REF_NAME` would be `main`, and
+      # the verifier would rightly reject it. The release step below is gated on
+      # a strictly narrower condition than this one, so a run that creates a
+      # release has always passed through here.
+      - name: Verify tag matches package version
+        if: github.ref_type == 'tag'
+        run: npm run release:verify-tag -- "${GITHUB_REF_NAME}"
+
+      - name: Run the quality gate
+        run: npm run check
+
+      - name: Verify the packed package
+        run: npm run package:smoke
+
+      - name: Pack the release artifact
+        run: |
+          mkdir -p release-artifact
+          npm pack --pack-destination release-artifact
+
+      - name: Upload the packed package
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-tarball
+          path: release-artifact/*.tgz
+          if-no-files-found: error
+
+      # Only a pushed tag creates a release. `github.ref_type == 'tag'` alone
+      # would not be enough: the Actions "Run workflow" dropdown lists tags as
+      # well as branches, so a manual run started from `v1.0.0` would satisfy it
+      # and publish a release nobody asked for. Requiring the push event too
+      # makes the dry run a dry run wherever it is started from, and it is
+      # strictly narrower than the verification condition above, so a release
+      # can never be created by a run that skipped the version check.
+      - name: Create the GitHub Release
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            release-artifact/*.tgz \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "${GITHUB_REF_NAME}" \
+            --notes "See CHANGELOG.md for what changed in ${GITHUB_REF_NAME}."
+
+      # So that a manual run says what it was, rather than looking like a
+      # release that quietly failed to appear.
+      - name: Report the dry run
+        if: github.event_name != 'push'
+        run: |
+          echo "Dry run: package built, verified and uploaded as an artifact."
+          echo "No GitHub Release was created, and nothing was published to npm."
+          echo "To cut a real release, push a v* tag. See docs/release-checklist.md."
