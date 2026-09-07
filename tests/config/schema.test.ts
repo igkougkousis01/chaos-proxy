@@ -81,7 +81,7 @@ describe('parseConfig', () => {
 
   it('rejects an unknown top-level field', () => {
     expect(() => parseConfig({ target: TARGET, foo: 1 })).toThrow(
-      'Invalid config: unknown field "foo".',
+      'Invalid config: unknown field "foo". Known fields: target, port, defaults, rules.',
     );
   });
 
@@ -91,13 +91,44 @@ describe('parseConfig', () => {
     expect(() => parseConfig({ target: TARGET, rule: [] })).toThrow(/unknown field "rule"/);
   });
 
+  it('rejects a "logging" section, offering the fields that do exist', () => {
+    expect(() => parseConfig({ target: TARGET, logging: { level: 'debug' } })).toThrow(
+      'Invalid config: unknown field "logging". Known fields: target, port, defaults, rules.',
+    );
+  });
+
+  /**
+   * Every message says where the problem is before it says what it is, so the
+   * line to look at can be found without re-reading the whole file.
+   */
+  it.each([
+    [{ target: TARGET, defaults: { errorRate: 5 } }, 'defaults.errorRate'],
+    [{ target: TARGET, defaults: { resetRate: 5 } }, 'defaults.resetRate'],
+    [{ target: TARGET, defaults: { latency: 1 } }, 'defaults contains unknown field'],
+    [
+      { target: TARGET, rules: [{ match: '/a' }, { match: '/b', timeoutRate: 5 }] },
+      'rules[1].timeoutRate',
+    ],
+    [
+      { target: TARGET, rules: [{ match: '/a' }, { match: '/b' }, { match: 'c' }] },
+      'rules[2].match',
+    ],
+    [{ target: TARGET, rules: [{ match: '/a', foo: 1 }] }, 'rules[0] contains unknown field'],
+    [{ target: TARGET, port: 0 }, 'port'],
+  ])('says where the problem is in %j', (document, path) => {
+    expect(() => parseConfig(document)).toThrow(ConfigError);
+    expect(() => parseConfig(document)).toThrow(path);
+  });
+
   describe('target', () => {
     it.each([[42], [null], [{}], [['a']]])('rejects a target of %j', (target) => {
-      expect(() => parseConfig({ target })).toThrow('Invalid config: "target" must be a string.');
+      expect(() => parseConfig({ target })).toThrow(
+        'Invalid config: target must be a string, for example "http://localhost:3000".',
+      );
     });
 
     it('rejects an empty target', () => {
-      expect(() => parseConfig({ target: '' })).toThrow(/"target" must not be empty/);
+      expect(() => parseConfig({ target: '' })).toThrow(/target must not be empty/);
     });
 
     // The proxy core is the authority on what a usable target is, so the schema
@@ -114,7 +145,7 @@ describe('parseConfig', () => {
 
     it.each([0, -1, 65_536, 4000.5, '4000', null])('rejects a port of %j', (port) => {
       expect(() => parseConfig({ target: TARGET, port })).toThrow(
-        'Invalid config: "port" must be an integer between 1 and 65535.',
+        'Invalid config: port must be an integer between 1 and 65535.',
       );
     });
 
@@ -142,14 +173,14 @@ describe('parseConfig', () => {
       'rejects a defaults block of %j',
       (defaults) => {
         expect(() => parseConfig({ target: TARGET, defaults })).toThrow(
-          'Invalid config: "defaults" must be a mapping of chaos settings.',
+          'Invalid config: defaults must be a mapping of chaos settings, such as "latencyMs: 250".',
         );
       },
     );
 
     it('rejects an unknown field inside defaults', () => {
       expect(() => parseConfig({ target: TARGET, defaults: { latency: 100 } })).toThrow(
-        'Invalid config: unknown field "latency" in "defaults".',
+        'Invalid config: defaults contains unknown field "latency". Known fields: latencyMs, errorRate, errorStatus, timeoutRate, timeoutMs, resetRate.',
       );
     });
 
@@ -198,7 +229,7 @@ describe('parseConfig', () => {
 
     it.each([[null], [{}], ['/api/*'], [5]])('rejects a rules value of %j', (rules) => {
       expect(() => parseConfig({ target: TARGET, rules })).toThrow(
-        'Invalid config: "rules" must be a list of rules.',
+        'Invalid config: rules must be a list of rules, each of them a mapping with a "match".',
       );
     });
 
@@ -223,7 +254,9 @@ describe('parseConfig', () => {
     it('rejects an unknown field inside a rule', () => {
       expect(() =>
         parseConfig({ target: TARGET, rules: [{ match: '/a' }, { match: '/b', method: 'GET' }] }),
-      ).toThrow('Invalid config: unknown field "method" in rules[1].');
+      ).toThrow(
+        'Invalid config: rules[1] contains unknown field "method". Known fields: match, latencyMs, errorRate, errorStatus, timeoutRate, timeoutMs, resetRate.',
+      );
     });
 
     it.each([

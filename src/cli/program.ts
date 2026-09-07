@@ -15,6 +15,7 @@ import {
   inFlagTerms,
   parseCliArgs,
 } from './options.js';
+import { formatEffectiveConfig } from './print.js';
 import { resolveCommand } from './resolve.js';
 import type { ResolvedCommand } from './resolve.js';
 
@@ -262,7 +263,8 @@ function withRequestLogging(
  *
  * `--quiet` suppresses informational output only — the startup summary, the
  * per-request lines, and the shutdown notice. Every error still goes to stderr,
- * and `--help` and `--version` still print what they were asked for.
+ * and `--help`, `--version` and `--print-config` still print what they were
+ * asked for: it silences what the CLI volunteers, not what it was told to say.
  */
 export async function runCli(argv: readonly string[], io: CliIo = consoleIo): Promise<number> {
   function reportUsageError(message: string): number {
@@ -274,6 +276,7 @@ export async function runCli(argv: readonly string[], io: CliIo = consoleIo): Pr
 
   let command: ResolvedCommand;
   let quiet: boolean;
+  let printConfig: boolean;
 
   try {
     const parsed = parseCliArgs(argv);
@@ -289,6 +292,7 @@ export async function runCli(argv: readonly string[], io: CliIo = consoleIo): Pr
     }
 
     quiet = parsed.command.quiet;
+    printConfig = parsed.command.printConfig;
     command = resolveCommand(parsed.command);
   } catch (error) {
     if (error instanceof CliError || error instanceof ConfigError) {
@@ -296,6 +300,17 @@ export async function runCli(argv: readonly string[], io: CliIo = consoleIo): Pr
     }
 
     throw error;
+  }
+
+  // Everything above is exactly what a run does, which is the point: the
+  // configuration printed here is the one that would have been started, down to
+  // the target and the values the core would have rejected. Nothing below this
+  // happens — no server is created, so no port is bound and no upstream is ever
+  // contacted. It goes to `io` rather than the quiet-aware stream because it was
+  // asked for by name.
+  if (printConfig) {
+    io.out(formatEffectiveConfig(command.effective));
+    return 0;
   }
 
   // Errors keep their stream; only what the CLI would otherwise volunteer is

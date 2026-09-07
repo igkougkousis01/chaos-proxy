@@ -155,10 +155,46 @@ rules:
     expect(() => loadConfigFile(path)).toThrow(/must contain a YAML mapping/);
   });
 
-  it('passes a schema violation straight through', () => {
+  // Which file a complaint is about is not obvious any more: `./chaos.yml` is
+  // picked up without being named, so the message names it instead.
+  it('names the file a schema violation was found in', () => {
     const path = writeConfig('target: http://localhost:3000\nfoo: 1\n');
 
-    expect(() => loadConfigFile(path)).toThrow('Invalid config: unknown field "foo".');
+    expect(() => loadConfigFile(path)).toThrow(ConfigError);
+    expect(() => loadConfigFile(path)).toThrow(
+      `Invalid config in ${path}: unknown field "foo". Known fields: target, port, defaults, rules.`,
+    );
+  });
+
+  it('names it for a problem deep inside the file too', () => {
+    const path = writeConfig(`target: http://localhost:3000
+
+rules:
+  - match: /a
+  - match: /b
+    timeoutRate: 5
+`);
+
+    expect(() => loadConfigFile(path)).toThrow(
+      `Invalid config in ${path}: rules[1].timeoutRate 5:`,
+    );
+  });
+
+  it('keeps a YAML parse failure to one line, ending it cleanly', () => {
+    const path = writeConfig('target: http://localhost:3000\nrules: [oops\n');
+
+    const error = (() => {
+      try {
+        loadConfigFile(path);
+        return undefined;
+      } catch (thrown) {
+        return thrown as Error;
+      }
+    })();
+
+    // The parser's first line ends with the colon that introduces its source
+    // snippet; the snippet is dropped, so the colon goes with it.
+    expect(error?.message).toMatch(/at line \d+, column \d+\.$/);
   });
 
   it('accepts a .yaml extension just as readily', () => {

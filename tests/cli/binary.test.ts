@@ -1,6 +1,6 @@
 import { execFile, spawn } from 'node:child_process';
 import type { ChildProcessByStdio } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer, request as httpRequest } from 'node:http';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
@@ -9,6 +9,7 @@ import { join } from 'node:path';
 import type { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
+import { parse as parseYaml } from 'yaml';
 import { afterEach, beforeAll, describe, expect, it } from 'vitest';
 
 /**
@@ -78,20 +79,41 @@ afterEach(async () => {
   }
 });
 
-/** Writes a config file that is removed after the test that made it. */
-function writeTempConfig(contents: string): string {
+/** A scratch directory that is removed after the test that made it. */
+function makeTempDir(): string {
   const dir = mkdtempSync(join(tmpdir(), 'chaos-proxy-cli-'));
   tempDirs.push(dir);
-  const path = join(dir, 'chaos.yml');
+
+  return dir;
+}
+
+/** Writes a config file that is removed after the test that made it. */
+function writeTempConfig(contents: string, name = 'chaos.yml'): string {
+  const path = join(makeTempDir(), name);
   writeFileSync(path, contents, 'utf8');
 
   return path;
 }
 
-/** Spawns the built CLI, capturing both streams. */
-function startCli(args: readonly string[]): CliProcess {
+/** Writes `name` into `dir`, for tests about which file gets picked up. */
+function writeConfigIn(dir: string, name: string, contents: string): string {
+  const path = join(dir, name);
+  writeFileSync(path, contents, 'utf8');
+
+  return path;
+}
+
+/**
+ * Spawns the built CLI, capturing both streams.
+ *
+ * `cwd` defaults to the repository root, which holds no `chaos.yml`, so an
+ * ordinary test is unaffected by config discovery. A test about discovery
+ * passes a scratch directory instead, so nothing is left to the directory the
+ * suite happens to be run from.
+ */
+function startCli(args: readonly string[], cwd = repoRoot): CliProcess {
   const child = spawn(process.execPath, [cliPath, ...args], {
-    cwd: repoRoot,
+    cwd,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
 
@@ -1261,4 +1283,194 @@ defaults:
     cli.child.kill('SIGINT');
     await expect(cli.exit).resolves.toMatchObject({ code: 0 });
   }, 30_000);
+});
+
+/**
+ * The conventional config file and `--print-config`, driven as real processes.
+ *
+ * Both are about where the command was run from and what it wrote to stdout,
+ * which is exactly what an in-process test cannot show: every one of these runs
+ * the compiled CLI in a scratch directory of its own.
+ */
+describe('the built CLI config discovery', () => {
+  const CONFIG = `target: http://127.0.0.1:1
+
+defaults:
+  latencyMs: 250
+`;
+
+  it('loads ./chaos.yml without being asked to', async () => {
+    const dir = makeTempDir();
+    const path = writeConfigIn(dir, 'chaos.yml', CONFIG);
+    const cli = startCli(['--print-config'], dir);
+
+    await expect(cli.exit).resolves.toMatchObject({ code: 0 });
+    expect(cli.stdout()).toContain(`config: ${realpathSync(path)}`);
+    expect(cli.stdout()).toContain('latencyMs: 250');
+  }, 20_000);
+
+  it('says nothing about a config file when there is none', async () => {
+    const cli = startCli(['--target', 'http://127.0.0.1:1', '--print-config'], makeTempDir());
+
+    await expect(cli.exit).resolves.toMatchObject({ code: 0 });
+    expect(cli.stdout()).toContain('config: null');
+    expect(cli.stdout()).not.toContain('Config: none');
+    expect(cli.stderr()).toBe('');
+  }, 20_000);
+
+  it('lets an explicit --config beat the conventional file', async () => {
+    const dir = makeTempDir();
+    writeConfigIn(dir, 'chaos.yml', 'target: http://127.0.0.1:1\ndefaults:\n  latencyMs: 250\n');
+    const other = writeConfigIn(
+      dir,
+      'other.yml',
+      'target: http://127.0.0.1:2\ndefaults:\n  latencyMs: 999\n',
+    );
+    const cli = startCli(['--config', 'other.yml', '--print-config'], dir);
+
+    await expect(cli.exit).resolves.toMatchObject({ code: 0 });
+    expect(cli.stdout()).toContain(`config: ${realpathSync(other)}`);
+    expect(cli.stdout()).toContain('latencyMs: 999');
+    expect(cli.stdout()).toContain('target: http://127.0.0.1:2');
+  }, 20_000);
+
+  // Explicit intent wins even when it is wrong: falling back here would run a
+  // configuration nobody asked for and call it success.
+  it('fails on an explicit missing --config even with a chaos.yml right there', async () => {
+    const dir = makeTempDir();
+    writeConfigIn(dir, 'chaos.yml', CONFIG);
+    const cli = startCli(['--config', './missing.yml', '--print-config'], dir);
+
+    const { code } = await cli.exit;
+
+    expect(code).toBe(1);
+    expect(cli.stdout()).toBe('');
+    expect(cli.stderr()).toContain('Config file not found');
+    expect(cli.stderr()).toContain('missing.yml');
+    expect(cli.stderr()).not.toContain('at ');
+  }, 20_000);
+
+  it('names the discovered file in its startup summary, and serves it', async () => {
+    const upstream = await startUpstream();
+    const dir = makeTempDir();
+    const path = writeConfigIn(
+      dir,
+      'chaos.yml',
+      `target: ${upstream.origin}\n\nrules:\n  - match: /fail/*\n    errorRate: 1\n    errorStatus: 503\n`,
+    );
+    const port = await findFreePort();
+    const cli = startCli(['--port', String(port)], dir);
+
+    await waitForOutput(cli, 'Rules: 1');
+
+    expect(cli.stdout()).toContain(`Config: ${realpathSync(path)}`);
+
+    const failed = await fetch(`http://127.0.0.1:${port}/fail/now`);
+    const forwarded = await fetch(`http://127.0.0.1:${port}/ok`);
+
+    expect(failed.status).toBe(503);
+    expect(forwarded.status).toBe(200);
+
+    cli.child.kill('SIGINT');
+    await expect(cli.exit).resolves.toMatchObject({ code: 0 });
+  }, 30_000);
+
+  it('reports a broken conventional file against the path it found', async () => {
+    const dir = makeTempDir();
+    const path = writeConfigIn(dir, 'chaos.yml', 'target: http://127.0.0.1:1\nlogging: debug\n');
+    const cli = startCli([], dir);
+
+    const { code } = await cli.exit;
+
+    expect(code).toBe(1);
+    expect(cli.stdout()).toBe('');
+    expect(cli.stderr()).toContain(`Invalid config in ${realpathSync(path)}`);
+    expect(cli.stderr()).toContain('unknown field "logging"');
+    expect(cli.stderr()).not.toContain('at ');
+  }, 20_000);
+});
+
+describe('the built CLI with --print-config', () => {
+  it('documents the option in its help', async () => {
+    const cli = startCli(['--help']);
+
+    await expect(cli.exit).resolves.toMatchObject({ code: 0 });
+    expect(cli.stdout()).toContain('--print-config');
+    expect(cli.stdout()).toContain('./chaos.yml');
+  }, 20_000);
+
+  it('prints clean YAML, exits 0, and never listens or contacts the upstream', async () => {
+    const upstream = await startUpstream();
+    const dir = makeTempDir();
+    writeConfigIn(
+      dir,
+      'chaos.yml',
+      `target: ${upstream.origin}\n\ndefaults:\n  latencyMs: 100\n\nrules:\n  - match: /api/payments/*\n    errorRate: 1\n    errorStatus: 503\n`,
+    );
+    const port = await findFreePort();
+    const cli = startCli(['--port', String(port), '--print-config'], dir);
+
+    await expect(cli.exit).resolves.toMatchObject({ code: 0 });
+    expect(cli.stderr()).toBe('');
+
+    // Parses as YAML on its own, with no summary line wrapped around it.
+    const document = parseYaml(cli.stdout()) as Record<string, unknown>;
+
+    expect(document).toMatchObject({
+      target: upstream.origin,
+      port,
+      preset: null,
+      seed: null,
+      defaults: { latencyMs: 100, errorRate: 0, errorStatus: 500, resetRate: 0 },
+      rules: [{ match: '/api/payments/*', latencyMs: 100, errorRate: 1, errorStatus: 503 }],
+    });
+    expect(cli.stdout()).not.toContain('listening on');
+
+    // Nothing was started: the port it named is still free to bind, and the
+    // upstream never saw a connection.
+    await expect(attempt(`http://127.0.0.1:${port}/`)).resolves.toMatchObject({ failed: true });
+    expect(upstream.connectionCount()).toBe(0);
+    expect(upstream.requests).toHaveLength(0);
+  }, 30_000);
+
+  it('still prints under --quiet', async () => {
+    const dir = makeTempDir();
+    writeConfigIn(dir, 'chaos.yml', 'target: http://127.0.0.1:1\n');
+    const quiet = startCli(['--quiet', '--print-config'], dir);
+
+    await expect(quiet.exit).resolves.toMatchObject({ code: 0 });
+    expect(quiet.stdout()).toContain('target: http://127.0.0.1:1');
+
+    const loud = startCli(['--print-config'], dir);
+    await loud.exit;
+
+    expect(quiet.stdout()).toBe(loud.stdout());
+  }, 30_000);
+
+  it('prints the same text every run', async () => {
+    const dir = makeTempDir();
+    writeConfigIn(
+      dir,
+      'chaos.yml',
+      'target: http://127.0.0.1:1\n\nrules:\n  - match: /a/*\n    resetRate: 0.5\n',
+    );
+    const args = ['--preset', 'flaky-api', '--seed', 'checkout-test', '--print-config'];
+    const runs = [startCli(args, dir), startCli(args, dir), startCli(args, dir)];
+
+    await Promise.all(runs.map((run) => run.exit));
+
+    expect(new Set(runs.map((run) => run.stdout())).size).toBe(1);
+    expect(runs[0]?.stdout()).toContain('seed: checkout-test');
+    expect(runs[0]?.stdout()).toContain('preset: flaky-api');
+  }, 30_000);
+
+  it('fails with the ordinary missing-target error when nothing supplies one', async () => {
+    const cli = startCli(['--print-config'], makeTempDir());
+
+    const { code } = await cli.exit;
+
+    expect(code).not.toBe(0);
+    expect(cli.stdout()).toBe('');
+    expect(cli.stderr()).toContain('--target');
+  }, 20_000);
 });
