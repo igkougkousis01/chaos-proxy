@@ -102,6 +102,7 @@ describe('runCli --help', () => {
     '--error-status',
     '--timeout-rate',
     '--timeout',
+    '--quiet',
     '--help',
     '--version',
   ])('documents %s', async (flag) => {
@@ -196,5 +197,45 @@ describe('runCli startup failures', () => {
 
     expect(io.stdout).toEqual([]);
     expect(io.stderr.join('\n')).toContain(`port ${port} is already in use`);
+  });
+
+  it('still reports one on stderr under --quiet', async () => {
+    const port = await occupyPort();
+    const io = captureIo();
+
+    await expect(
+      runCli(['--target', 'http://127.0.0.1:1', '--port', String(port), '--quiet'], io),
+    ).resolves.toBe(1);
+
+    // --quiet drops what the CLI would volunteer, never what it has to report.
+    expect(io.stdout).toEqual([]);
+    expect(io.stderr.join('\n')).toContain(`port ${port} is already in use`);
+  });
+});
+
+describe('runCli --quiet', () => {
+  it('does not suppress --help', async () => {
+    const io = captureIo();
+
+    await expect(runCli(['--quiet', '--help'], io)).resolves.toBe(0);
+
+    expect(io.stdout.join('\n')).toContain('chaos-proxy --target <url> [options]');
+  });
+
+  it('does not suppress --version', async () => {
+    const io = captureIo();
+
+    await expect(runCli(['--quiet', '--version'], io)).resolves.toBe(0);
+
+    expect(io.stdout).toEqual([packageVersion()]);
+  });
+
+  it('does not suppress a usage mistake', async () => {
+    const io = captureIo();
+
+    await expect(runCli(['--quiet'], io)).resolves.toBe(1);
+
+    expect(io.stdout).toEqual([]);
+    expect(io.stderr.join('\n')).toContain('--target');
   });
 });

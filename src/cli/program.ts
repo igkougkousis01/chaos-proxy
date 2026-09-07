@@ -3,6 +3,8 @@ import type { Server } from 'node:http';
 
 import { ConfigError } from '../config/schema.js';
 import { createProxyServer } from '../index.js';
+import type { ProxyServerOptions } from '../index.js';
+import { formatRequestLog } from './log.js';
 import {
   CLI_NAME,
   CliError,
@@ -24,6 +26,15 @@ export interface CliIo {
 
 /** Signals that ask the proxy to stop. */
 const SHUTDOWN_SIGNALS = ['SIGINT', 'SIGTERM'] as const;
+
+/**
+ * Discards informational output, so `--quiet` is expressed in exactly one
+ * place: what the CLI has to say still goes to stderr, and everything it merely
+ * mentions goes nowhere.
+ */
+const SILENT: CliIo['out'] = () => {
+  // Deliberately empty; see above.
+};
 
 const consoleIo: CliIo = {
   out: (text) => {
@@ -193,12 +204,40 @@ function listen(server: Server, command: ResolvedCommand, io: CliIo): Promise<nu
 }
 
 /**
+ * The options handed to `createProxyServer`, with request logging attached
+ * unless it was switched off.
+ *
+ * The proxy core is silent on its own and knows nothing about how a line is
+ * shaped; this is where its facts become the output a developer reads.
+ */
+function withRequestLogging(
+  proxy: ProxyServerOptions,
+  quiet: boolean,
+  io: CliIo,
+): ProxyServerOptions {
+  if (quiet) {
+    return proxy;
+  }
+
+  return {
+    ...proxy,
+    onRequestComplete: (event) => {
+      io.out(formatRequestLog(event, new Date()));
+    },
+  };
+}
+
+/**
  * Runs the CLI and resolves with the process exit code.
  *
  * Expected problems — a usage mistake, an unusable config file, an option the
  * proxy core rejects, or a port that cannot be bound — are reported as a single
  * line and a non-zero code. Anything else is left to propagate, so a real
  * defect still shows its stack trace.
+ *
+ * `--quiet` suppresses informational output only — the startup summary, the
+ * per-request lines, and the shutdown notice. Every error still goes to stderr,
+ * and `--help` and `--version` still print what they were asked for.
  */
 export async function runCli(argv: readonly string[], io: CliIo = consoleIo): Promise<number> {
   function reportUsageError(message: string): number {
@@ -209,6 +248,7 @@ export async function runCli(argv: readonly string[], io: CliIo = consoleIo): Pr
   }
 
   let command: ResolvedCommand;
+  let quiet: boolean;
 
   try {
     const parsed = parseCliArgs(argv);
@@ -223,6 +263,7 @@ export async function runCli(argv: readonly string[], io: CliIo = consoleIo): Pr
       return 0;
     }
 
+    quiet = parsed.command.quiet;
     command = resolveCommand(parsed.command);
   } catch (error) {
     if (error instanceof CliError || error instanceof ConfigError) {
@@ -232,10 +273,13 @@ export async function runCli(argv: readonly string[], io: CliIo = consoleIo): Pr
     throw error;
   }
 
+  // Errors keep their stream; only what the CLI would otherwise volunteer is
+  // dropped, so a quiet run that fails still says why.
+  const runIo: CliIo = quiet ? { out: SILENT, err: io.err } : io;
   let server: Server;
 
   try {
-    server = createProxyServer(command.proxy);
+    server = createProxyServer(withRequestLogging(command.proxy, quiet, runIo));
   } catch (error) {
     // The proxy core is the authority on what its options may contain; the CLI
     // only translates its complaint back into the flag that carried the value.
@@ -246,5 +290,5 @@ export async function runCli(argv: readonly string[], io: CliIo = consoleIo): Pr
     throw error;
   }
 
-  return await listen(server, command, io);
+  return await listen(server, command, runIo);
 }

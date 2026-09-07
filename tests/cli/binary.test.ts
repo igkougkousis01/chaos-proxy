@@ -121,8 +121,13 @@ function startCli(args: readonly string[]): CliProcess {
   return cli;
 }
 
-/** Waits for `text` to appear on the CLI's stdout, or fails with what it saw. */
-function waitForOutput(cli: CliProcess, text: string): Promise<void> {
+/**
+ * Waits for `expected` to appear on the CLI's stdout, or fails with what it saw.
+ *
+ * A pattern is accepted as well as a literal, because a request log line
+ * carries a timestamp and a duration that no test should be pinning down.
+ */
+function waitForOutput(cli: CliProcess, expected: string | RegExp): Promise<void> {
   return new Promise<void>((resolve, reject) => {
     let settled = false;
 
@@ -143,7 +148,9 @@ function waitForOutput(cli: CliProcess, text: string): Promise<void> {
     }
 
     function seen(): boolean {
-      return cli.stdout().includes(text);
+      return typeof expected === 'string'
+        ? cli.stdout().includes(expected)
+        : expected.test(cli.stdout());
     }
 
     function describe(what: string): Error {
@@ -157,7 +164,7 @@ function waitForOutput(cli: CliProcess, text: string): Promise<void> {
     }
 
     const timer = setTimeout(() => {
-      finish(describe(`timed out waiting for ${JSON.stringify(text)}.`));
+      finish(describe(`timed out waiting for ${String(expected)}.`));
     }, WAIT_TIMEOUT_MS);
 
     cli.child.stdout.on('data', onData);
@@ -248,6 +255,35 @@ async function startProxyCli(
   await waitForOutput(cli, readyText);
 
   return { cli, baseUrl: `http://127.0.0.1:${port}` };
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise<void>((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+/**
+ * Requests `url`, retrying until the proxy is accepting connections.
+ *
+ * `--quiet` prints nothing at all, so there is no startup line to wait for; the
+ * listener itself becomes the readiness signal. The retry loop is bounded, so a
+ * proxy that never comes up fails rather than hanging.
+ */
+async function fetchWhenListening(url: string): Promise<Response> {
+  const deadline = Date.now() + WAIT_TIMEOUT_MS;
+
+  for (;;) {
+    try {
+      return await fetch(url);
+    } catch (error) {
+      if (Date.now() > deadline) {
+        throw new Error(`timed out waiting for ${url} to accept connections`, { cause: error });
+      }
+
+      await sleep(50);
+    }
+  }
 }
 
 describe('package bin entry', () => {
@@ -378,6 +414,149 @@ describe('the built CLI', () => {
     await expect(response.text()).resolves.toBe('Chaos Proxy injected error');
     expect(upstream.requests).toHaveLength(0);
   }, 30_000);
+});
+
+describe('the built CLI request logging', () => {
+  it('prints one completion line per request by default', async () => {
+    const upstream = await startUpstream();
+    const { cli, baseUrl } = await startProxyCli(upstream.origin);
+
+    const response = await fetch(`${baseUrl}/api/users?page=2`);
+    expect(response.status).toBe(200);
+    await response.text();
+
+    // Components rather than a whole line: the timestamp and the duration are
+    // real and must not be pinned down.
+    await waitForOutput(cli, /\d{2}:\d{2}:\d{2} +GET +\/api\/users -> 200 \d+ms forwarded/);
+
+    // The query string is forwarded but deliberately kept out of the log line.
+    expect(upstream.requests[0]?.url).toBe('/api/users?page=2');
+    expect(cli.stdout()).not.toContain('page=2');
+    expect(cli.stderr()).toBe('');
+  }, 30_000);
+
+  it('prints one line per request and no more', async () => {
+    const upstream = await startUpstream();
+    const { cli, baseUrl } = await startProxyCli(upstream.origin);
+
+    for (const path of ['/one', '/two', '/three']) {
+      await (await fetch(`${baseUrl}${path}`)).text();
+    }
+
+    await waitForOutput(cli, '/three');
+    await sleep(200);
+
+    const completionLines = cli
+      .stdout()
+      .split('\n')
+      .filter((line) => /-> \d{3} /.test(line));
+
+    expect(completionLines).toHaveLength(3);
+  }, 30_000);
+
+  it('reports the effective latency alongside a forwarded request', async () => {
+    const upstream = await startUpstream();
+    const { cli, baseUrl } = await startProxyCli(
+      upstream.origin,
+      ['--latency', '300'],
+      'Latency: 300ms',
+    );
+
+    await (await fetch(`${baseUrl}/api/profile`)).text();
+
+    await waitForOutput(cli, /\/api\/profile -> 200 \d+ms forwarded latency:\+300ms/);
+  }, 30_000);
+
+  it('identifies an injected error', async () => {
+    const upstream = await startUpstream();
+    const { cli, baseUrl } = await startProxyCli(
+      upstream.origin,
+      ['--error-rate', '1', '--error-status', '503'],
+      'Error injection: 100% -> 503',
+    );
+
+    const response = await fetch(`${baseUrl}/api/payments/123`, { method: 'POST' });
+    expect(response.status).toBe(503);
+    await response.text();
+
+    await waitForOutput(cli, /POST +\/api\/payments\/123 -> 503 \d+ms injected:error/);
+  }, 30_000);
+
+  it('identifies an injected timeout', async () => {
+    const upstream = await startUpstream();
+    const { cli, baseUrl } = await startProxyCli(
+      upstream.origin,
+      ['--timeout-rate', '1', '--timeout', '50'],
+      'Timeout injection: 100% -> 50ms',
+    );
+
+    const response = await fetch(`${baseUrl}/api/search`);
+    expect(response.status).toBe(504);
+    await response.text();
+
+    await waitForOutput(cli, /\/api\/search -> 504 \d+ms injected:timeout/);
+  }, 30_000);
+
+  it('documents --quiet in its help', async () => {
+    const cli = startCli(['--help']);
+
+    await expect(cli.exit).resolves.toMatchObject({ code: 0 });
+    expect(cli.stdout()).toContain('--quiet');
+  }, 20_000);
+});
+
+describe('the built CLI with --quiet', () => {
+  it('prints neither startup nor request lines, but still proxies', async () => {
+    const upstream = await startUpstream();
+    const port = await findFreePort();
+    const cli = startCli(['--target', upstream.origin, '--port', String(port), '--quiet']);
+
+    const response = await fetchWhenListening(`http://127.0.0.1:${port}/api/users`);
+
+    expect(response.status).toBe(200);
+    await expect(response.text()).resolves.toBe('upstream ok');
+    expect(upstream.requests[0]?.url).toBe('/api/users');
+
+    // Long enough that a completion line would have been written by now.
+    await sleep(200);
+
+    expect(cli.stdout()).toBe('');
+    expect(cli.stderr()).toBe('');
+  }, 30_000);
+
+  it('stays silent through shutdown as well', async () => {
+    const upstream = await startUpstream();
+    const port = await findFreePort();
+    const cli = startCli(['--target', upstream.origin, '--port', String(port), '--quiet']);
+
+    await fetchWhenListening(`http://127.0.0.1:${port}/api/users`);
+    cli.child.kill('SIGINT');
+
+    await expect(cli.exit).resolves.toMatchObject({ code: 0, signal: null });
+    expect(cli.stdout()).toBe('');
+    expect(cli.stderr()).toBe('');
+  }, 30_000);
+
+  it('still reports a startup failure on stderr', async () => {
+    const port = await occupyPort();
+    const cli = startCli(['--target', 'http://127.0.0.1:1', '--port', String(port), '--quiet']);
+
+    const { code } = await cli.exit;
+
+    expect(code).toBe(1);
+    expect(cli.stdout()).toBe('');
+    expect(cli.stderr()).toContain(`port ${port} is already in use`);
+  }, 20_000);
+
+  it('still reports a usage mistake on stderr', async () => {
+    const cli = startCli(['--quiet']);
+
+    const { code } = await cli.exit;
+
+    expect(code).not.toBe(0);
+    expect(cli.stdout()).toBe('');
+    expect(cli.stderr()).toContain('--target');
+  }, 20_000);
 });
 
 describe('the built CLI with --config', () => {

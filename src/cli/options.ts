@@ -52,6 +52,8 @@ export interface CliCommand {
   readonly target: string | undefined;
   /** Chaos flags the user actually typed, and only those. */
   readonly chaos: ChaosOptions;
+  /** Whether `--quiet` was given, silencing everything but errors. */
+  readonly quiet: boolean;
 }
 
 /**
@@ -81,12 +83,18 @@ Options:
   --error-status <400-599>  Status code used by injected errors. Default: 500.
   --timeout-rate <0-1>      Fraction of requests held open and then timed out.
   --timeout <ms>            How long a timed-out request is held. Default: 30000.
+  --quiet                   Print nothing but errors, which still go to stderr.
   -h, --help                Show this help.
   -v, --version             Show the version.
 
 The proxy listens on ${LISTEN_HOST} only, so it is never exposed to the network.
 Each request receives at most one injected outcome, decided in this order:
 latency delay, then timeout, then error, then forwarding upstream.
+
+Every completed request prints one line, unless --quiet is given:
+
+  12:41:03 GET    /api/users -> 200 42ms forwarded
+  12:41:07 POST   /api/payments/123 -> 503 510ms injected:error latency:+500ms
 
 A config file adds per-endpoint rules; the first rule whose "match" fits the
 request path wins. Flags beat config values, which beat the built-in defaults.
@@ -210,6 +218,7 @@ export function parseCliArgs(argv: readonly string[]): ParsedCli {
         'error-status': { type: 'string' },
         'timeout-rate': { type: 'string' },
         timeout: { type: 'string' },
+        quiet: { type: 'boolean' },
         help: { type: 'boolean', short: 'h' },
         version: { type: 'boolean', short: 'v' },
       },
@@ -272,6 +281,7 @@ export function parseCliArgs(argv: readonly string[]): ParsedCli {
       port: typeof values.port === 'string' ? toPort(values.port) : undefined,
       target,
       chaos,
+      quiet: values.quiet === true,
     },
   };
 }

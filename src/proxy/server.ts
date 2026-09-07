@@ -7,6 +7,7 @@ import type {
   ServerResponse,
 } from 'node:http';
 import { request as httpsRequest } from 'node:https';
+import { performance } from 'node:perf_hooks';
 
 /**
  * The chaos a request can be subjected to.
@@ -79,6 +80,63 @@ export interface ResolvedChaosOptions {
   readonly timeoutMs: number;
 }
 
+/**
+ * What became of one request.
+ *
+ * The set is deliberately small and closed: it names which of the four fates a
+ * request met, and nothing about why. Which rule matched it, which random draw
+ * selected it, and what the upstream said about it are all outside it.
+ *
+ * `forwarded` means the request reached the upstream and the upstream's own
+ * response was returned — including when that response was an error, since a
+ * `500` the upstream chose is a different event from a `500` the proxy invented.
+ */
+export type RequestOutcome = 'forwarded' | 'injected:error' | 'injected:timeout' | 'upstream:error';
+
+/**
+ * What happened to one completed request, as handed to
+ * {@link ProxyServerOptions.onRequestComplete}.
+ *
+ * These are facts about a single request and nothing more: no headers, no
+ * bodies, no identifiers, and no formatting. Turning them into a line of
+ * output — timestamps, alignment, colour — belongs to whoever is doing the
+ * reporting.
+ */
+export interface RequestLogEvent {
+  /** Request method, as the client sent it, for example `GET`. */
+  readonly method: string;
+
+  /**
+   * Path the client asked for, with any query string dropped, for example
+   * `/api/search` for `/api/search?q=test`. This is the same path endpoint
+   * rules are matched against.
+   */
+  readonly pathname: string;
+
+  /** Status the client actually received. */
+  readonly statusCode: number;
+
+  /**
+   * Milliseconds from the request arriving at the proxy to its response
+   * completing, measured on a monotonic clock and left unrounded.
+   *
+   * It covers everything the proxy did, including any artificial latency and
+   * any injected timeout wait.
+   */
+  readonly durationMs: number;
+
+  /** Which of the four fates the request met. */
+  readonly outcome: RequestOutcome;
+
+  /**
+   * Effective artificial latency applied to this request, in milliseconds, and
+   * `0` when none was. This is the value that actually applied, so a request an
+   * endpoint rule gave its own latency reports the rule's value rather than the
+   * configured default.
+   */
+  readonly latencyMs: number;
+}
+
 /** Options accepted by {@link createProxyServer}. */
 export interface ProxyServerOptions extends ChaosOptions {
   /**
@@ -102,6 +160,21 @@ export interface ProxyServerOptions extends ChaosOptions {
    * the caller's job to translate its own configuration into chaos options.
    */
   readonly resolveChaos?: (request: IncomingMessage) => ChaosOptions;
+
+  /**
+   * Optional hook called exactly once per request, after its response has
+   * completed, with what happened to it.
+   *
+   * It is the only way anything leaves the proxy core besides the response
+   * itself: nothing is printed, and a caller that does not supply this hook
+   * gets no output at all. The `chaos-proxy` command line supplies one and
+   * formats what it receives; a programmatic caller decides for itself.
+   *
+   * It is not called for a request whose response never completed — a client
+   * that disconnects mid-response is reported as nothing rather than as a
+   * status it never received.
+   */
+  readonly onRequestComplete?: (event: RequestLogEvent) => void;
 }
 
 /**
@@ -378,6 +451,65 @@ function upstreamUrlFor(incoming: URL, target: URL): URL {
   return upstream;
 }
 
+/**
+ * Records the fate of one request, for whoever is tracking its completion.
+ *
+ * Calling it more than once is harmless — the last outcome wins — because the
+ * event is emitted from the response's own completion, never from here.
+ */
+type ReportOutcome = (outcome: RequestOutcome) => void;
+
+/** Used when nothing is tracking completions, so no request pays for them. */
+const NO_REPORT: ReportOutcome = () => {
+  // Deliberately empty: without an `onRequestComplete` hook there is nothing to
+  // record and no listener to attach.
+};
+
+/**
+ * Arranges for `onRequestComplete` to be called once, when this request's
+ * response completes, and returns the recorder its outcome is reported to.
+ *
+ * `close` fires exactly once per response and covers both completion and the
+ * client disconnecting, so it is the one place an event can be emitted from
+ * without risking a duplicate. Which of the two it was is read from
+ * `writableFinished`, which is only true once the whole response has been
+ * flushed: a request cut off mid-body is reported as nothing rather than as a
+ * success the client never saw.
+ *
+ * An outcome that was never recorded means the proxy never got as far as
+ * choosing one — the client went away during a delay — and is likewise silent.
+ */
+function trackCompletion(
+  req: IncomingMessage,
+  res: ServerResponse,
+  startedAt: number,
+  latencyMs: number,
+  onRequestComplete: (event: RequestLogEvent) => void,
+): ReportOutcome {
+  let outcome: RequestOutcome | undefined;
+
+  res.once('close', () => {
+    if (outcome === undefined || !res.writableFinished) {
+      return;
+    }
+
+    onRequestComplete({
+      method: req.method ?? '',
+      pathname: requestPathname(req.url ?? '/'),
+      // Read from the response rather than remembered separately, so the event
+      // can only ever report the status the client was actually sent.
+      statusCode: res.statusCode,
+      durationMs: performance.now() - startedAt,
+      outcome,
+      latencyMs,
+    });
+  });
+
+  return (chosen) => {
+    outcome = chosen;
+  };
+}
+
 /** Ends the response with a plain-text proxy error, if nothing was sent yet. */
 function sendProxyError(res: ServerResponse, statusCode: number, body: string): void {
   if (res.headersSent) {
@@ -390,10 +522,18 @@ function sendProxyError(res: ServerResponse, statusCode: number, body: string): 
 }
 
 /** Forwards one client request upstream and streams the response back. */
-function forward(req: IncomingMessage, res: ServerResponse, target: URL): void {
+function forward(
+  req: IncomingMessage,
+  res: ServerResponse,
+  target: URL,
+  report: ReportOutcome,
+): void {
   const incoming = parseRequestTarget(req.url ?? '/');
 
   if (incoming === undefined) {
+    // No outcome is recorded: the proxy could not tell what was being asked
+    // for, so this is a request it refused rather than one of the four fates a
+    // request it understood can meet.
     sendProxyError(res, 400, 'Bad Request');
     return;
   }
@@ -406,10 +546,12 @@ function forward(req: IncomingMessage, res: ServerResponse, target: URL): void {
   const upstreamReq = sendUpstream(upstreamUrl, { method: req.method, headers });
 
   upstreamReq.on('error', () => {
+    report('upstream:error');
     sendProxyError(res, 502, 'Bad Gateway');
   });
 
   upstreamReq.on('response', (upstreamRes) => {
+    report('forwarded');
     res.writeHead(upstreamRes.statusCode ?? 502, forwardableHeaders(upstreamRes.headers));
     upstreamRes.on('error', () => {
       res.destroy();
@@ -470,6 +612,9 @@ const CHAOS_RESOLUTION_ERROR_BODY = 'Chaos Proxy configuration error';
  * makes it request-dependent instead, by layering what the hook returns over
  * these options; see {@link ProxyServerOptions.resolveChaos}.
  *
+ * The server is silent: it prints nothing. Passing an `onRequestComplete` hook
+ * is the only way to find out what it did with a request.
+ *
  * @throws {TypeError} If `target` is not an absolute `http:` or `https:` URL.
  * @throws {RangeError} If `latencyMs` or `timeoutMs` is negative, `NaN`, or
  * infinite.
@@ -481,6 +626,7 @@ export function createProxyServer(options: ProxyServerOptions): Server {
   const target = parseTarget(options.target);
   const staticChaos = resolveChaosOptions(options);
   const resolveChaos = options.resolveChaos;
+  const onRequestComplete = options.onRequestComplete;
 
   /**
    * Starts one request, choosing exactly one outcome: a synthetic timeout, a
@@ -490,23 +636,33 @@ export function createProxyServer(options: ProxyServerOptions): Server {
    * opened and no request body is read; Node discards the unread body as part
    * of ending the response.
    */
-  function initiate(req: IncomingMessage, res: ServerResponse, chaos: ResolvedChaosOptions): void {
+  function initiate(
+    req: IncomingMessage,
+    res: ServerResponse,
+    chaos: ResolvedChaosOptions,
+    report: ReportOutcome,
+  ): void {
     if (shouldInjectTimeout(chaos.timeoutRate)) {
       runAfter(chaos.timeoutMs, res, () => {
+        report('injected:timeout');
         sendProxyError(res, INJECTED_TIMEOUT_STATUS, INJECTED_TIMEOUT_BODY);
       });
       return;
     }
 
     if (shouldInjectError(chaos.errorRate)) {
+      report('injected:error');
       sendProxyError(res, chaos.errorStatus, INJECTED_ERROR_BODY);
       return;
     }
 
-    forward(req, res, target);
+    forward(req, res, target, report);
   }
 
   return createServer((req, res) => {
+    // Taken before anything else, so a duration covers everything the proxy
+    // did with the request rather than starting after its own bookkeeping.
+    const startedAt = performance.now();
     let chaos: ResolvedChaosOptions;
 
     try {
@@ -518,17 +674,26 @@ export function createProxyServer(options: ProxyServerOptions): Server {
       // A hook that throws or returns an unusable value is a defect in the
       // caller's configuration, not in this request. It fails that request
       // rather than taking the whole process down with an uncaught exception.
+      // No outcome is recorded for the same reason as an unusable request
+      // target: the proxy never decided what to do with this request.
       sendProxyError(res, 500, CHAOS_RESOLUTION_ERROR_BODY);
       return;
     }
 
+    // Tracking starts once the effective chaos is known, because the event
+    // reports the latency that actually applied to this request.
+    const report =
+      onRequestComplete === undefined
+        ? NO_REPORT
+        : trackCompletion(req, res, startedAt, chaos.latencyMs, onRequestComplete);
+
     if (chaos.latencyMs === 0) {
-      initiate(req, res, chaos);
+      initiate(req, res, chaos, report);
       return;
     }
 
     runAfter(chaos.latencyMs, res, () => {
-      initiate(req, res, chaos);
+      initiate(req, res, chaos, report);
     });
   });
 }

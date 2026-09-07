@@ -22,7 +22,8 @@ Chaos Proxy should eventually support:
 - **Connection failures** — refuse, drop, or reset connections.
 - **Endpoint-specific rules** — apply different chaos behaviour per path, method, or pattern.
   _(ordered path rules from a YAML config file implemented; method and host rules are not)_
-- **Request logging** — show what was forwarded, what was degraded, and why.
+- **Request logging** — show what was forwarded, what was degraded, and why. _(one line per
+  completed request implemented; the "why" — which rule matched — is not)_
 
 ## Target users
 
@@ -68,6 +69,10 @@ This is a target, not a starting point. The repository deliberately keeps the mi
 needed today (`src/index.ts`, `src/cli.ts`, `src/cli/`, `src/config/`, and `src/proxy/`); each
 remaining directory above is created when the feature that needs it is implemented, rather than up
 front as empty scaffolding.
+
+`logger/` has not been created, and request logging did not warrant it: the proxy core reports a
+small event and `src/cli/log.ts` turns it into a line. A directory would be a home for a logging
+subsystem, and there is no subsystem — no levels, no sinks, no formats to choose between.
 
 ## Current status
 
@@ -135,6 +140,24 @@ over the static options for that request only. There is one proxy server regardl
 rules exist, and no shared state is mutated per request. A hook that throws or returns an
 out-of-range value fails that one request with a `500` rather than taking the process down.
 
+The proxy core prints nothing. A second optional hook, `onRequestComplete`, reports what happened
+to each request that completed — method, pathname, status, duration, outcome, and the artificial
+latency that actually applied — and a caller that does not supply it gets no output at all. The
+outcome is one of four values: `forwarded` (the upstream answered, whatever it answered),
+`injected:error`, `injected:timeout`, and `upstream:error`. The event carries facts and no
+formatting; `src/cli/log.ts` is where they become a line, so timestamps, alignment and durations
+rounded for reading all live on the command-line side and the config layer never sees them.
+
+Emission hangs off the response's own `close` event, which fires exactly once, so an error path
+and a completion path cannot both report the same request. Whether that close was a completion or
+a disconnect is read from `writableFinished`: a request the client abandoned mid-response reports
+nothing rather than a status it never received, and neither does one abandoned during a delay,
+where the proxy never chose an outcome at all. Durations come from `performance.now()`, measured
+from the moment the request arrives, so an adjusted system clock cannot produce a negative one.
+The two paths where the proxy refuses a request before choosing any outcome — an unparsable
+request target, and a `resolveChaos` hook that cannot produce usable options — report nothing,
+since neither is one of the four fates a request it understood can meet.
+
 `src/config/` implements the YAML config file, and is the only consumer of that hook:
 
 - `load.ts` reads the file — resolving a relative path against the working directory — and runs it
@@ -156,10 +179,17 @@ out-of-range value fails that one request with a `500` rather than taking the pr
 The config layer translates all of that into effective proxy options; the proxy core knows nothing
 about YAML, files, or rules.
 
+On the command line, request logging is on by default and `--quiet` turns it off, along with the
+startup summary and the shutdown notice — everything the CLI volunteers rather than everything it
+has to say, so errors still reach stderr and `--help` and `--version` still print. It is a flag
+only: the config file has no `logging` section, because a per-run choice about terminal noise does
+not belong in a file describing how an API should misbehave.
+
 Randomised or ranged delays and timeout durations, choosing between multiple or weighted error
-statuses, method- or host-specific rules, connection failures, and request logging do not exist
-yet. Neither does config auto-discovery, JSON config, environment variables, hot reload, or
-merging several matching rules: a config file is used only when `--config` names it.
+statuses, method- or host-specific rules, and connection failures do not exist yet. Neither do
+structured or JSON logs, log files, log levels, request IDs, tracing, metrics, or naming the rule
+that matched in a log line; nor config auto-discovery, JSON config, environment variables, hot
+reload, or merging several matching rules: a config file is used only when `--config` names it.
 
 It is built on `node:http` and `node:https`, with `yaml` as its one runtime dependency — parsing
 YAML by hand would be a defect waiting to happen, and it is the only thing the package needs that
