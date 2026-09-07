@@ -2,9 +2,9 @@
 
 A local developer tool for testing how an application behaves when its API misbehaves.
 
-> **Status: under development.** The proxy core can forward HTTP traffic to a target API, but
-> no chaos behaviour (latency, errors, timeouts) exists yet. The CLI currently only prints its
-> name.
+> **Status: under development.** The proxy core can forward HTTP traffic to a target API and
+> inject a fixed artificial latency. Other chaos behaviour (errors, timeouts) does not exist
+> yet, and the CLI currently only prints its name.
 
 ## What it will do
 
@@ -36,6 +36,26 @@ and `https:` targets are both supported; anything else is rejected when the serv
 the target cannot be reached, the client receives `502 Bad Gateway`.
 
 The local proxy listener itself is plain HTTP.
+
+## Latency injection
+
+`latencyMs` adds a fixed artificial delay to every request. It is programmatic only — there is
+no CLI flag for it yet.
+
+```ts
+const server = createProxyServer({
+  target: 'http://localhost:5000',
+  latencyMs: 500,
+});
+```
+
+The delay is paid once per request, before the proxy opens the upstream connection; request and
+response bodies then stream through as usual, so no individual chunk is slowed down. If the
+client disconnects while the delay is still running, no upstream request is made at all.
+
+Omitting `latencyMs` (or setting it to `0`) means no artificial delay. Negative, `NaN`, and
+infinite values are rejected with a `RangeError` when the server is created — they are never
+silently clamped.
 
 ## Requirements
 
@@ -73,7 +93,8 @@ node dist/cli.js
 | Project scaffolding | Done        |
 | CLI entry point     | Placeholder |
 | HTTP forwarding     | Done        |
-| Chaos behaviour     | Not started |
+| Latency injection   | Fixed delay |
+| Other chaos         | Not started |
 
 ## License
 

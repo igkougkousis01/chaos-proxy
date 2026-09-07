@@ -10,6 +10,7 @@ import type { AddressInfo } from 'node:net';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { createProxyServer } from '../../src/index.js';
+import type { ProxyServerOptions } from '../../src/index.js';
 
 /** A request as it arrived at the temporary upstream server. */
 interface RecordedRequest {
@@ -26,6 +27,8 @@ interface Upstream {
   readonly host: string;
   /** Every request the upstream received, in arrival order. */
   readonly requests: RecordedRequest[];
+  /** How many TCP connections the upstream has accepted so far. */
+  readonly connectionCount: () => number;
 }
 
 const startedServers = new Set<Server>();
@@ -89,16 +92,32 @@ async function startUpstream(
       handler(req, res);
     });
   });
+  let connections = 0;
+  server.on('connection', () => {
+    connections += 1;
+  });
   const { port } = await start(server);
 
-  return { origin: `http://127.0.0.1:${port}`, host: `127.0.0.1:${port}`, requests };
+  return {
+    origin: `http://127.0.0.1:${port}`,
+    host: `127.0.0.1:${port}`,
+    requests,
+    connectionCount: () => connections,
+  };
 }
 
 /** Starts a Chaos Proxy pointed at `target` and returns its base URL. */
-async function startProxy(target: string): Promise<string> {
-  const { port } = await start(createProxyServer({ target }));
+async function startProxy(target: string, latencyMs?: number): Promise<string> {
+  const options: ProxyServerOptions = latencyMs === undefined ? { target } : { target, latencyMs };
+  const { port } = await start(createProxyServer(options));
 
   return `http://127.0.0.1:${port}`;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise<void>((resolve) => {
+    setTimeout(resolve, ms);
+  });
 }
 
 /** A response as it arrived back at the client. */
@@ -157,6 +176,19 @@ describe('createProxyServer', () => {
     expect(() => createProxyServer({ target: 'ftp://example.com' })).toThrow(
       /only http: and https: are supported/,
     );
+  });
+
+  it.each([-1, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY])(
+    'rejects a latencyMs of %p',
+    (latencyMs) => {
+      expect(() => createProxyServer({ target: 'http://localhost:5000', latencyMs })).toThrow(
+        RangeError,
+      );
+    },
+  );
+
+  it.each([0, 250, 0.5])('accepts a latencyMs of %p', (latencyMs) => {
+    expect(() => createProxyServer({ target: 'http://localhost:5000', latencyMs })).not.toThrow();
   });
 });
 
@@ -292,5 +324,102 @@ describe('forwarding', () => {
     // The proxy is still serving, so the failure did not take the process down.
     const second = await fetch(`${proxyUrl}/api/users`);
     expect(second.status).toBe(502);
+  });
+});
+
+describe('latency injection', () => {
+  it('adds no artificial delay when latencyMs is omitted', async () => {
+    const upstream = await startUpstream((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/plain' });
+      res.end('ok');
+    });
+    const proxyUrl = await startProxy(upstream.origin);
+
+    const startedAt = performance.now();
+    const response = await fetch(`${proxyUrl}/api/users`);
+    const elapsed = performance.now() - startedAt;
+
+    expect(response.status).toBe(200);
+    await expect(response.text()).resolves.toBe('ok');
+    expect(upstream.requests).toHaveLength(1);
+    // Generous on purpose: this asserts that no latency is *configured*, not
+    // that a loopback round trip is fast.
+    expect(elapsed).toBeLessThan(500);
+  });
+
+  it('delays the start of the upstream request by the configured latency', async () => {
+    const arrivals: number[] = [];
+    const upstream = await startUpstream((_req, res) => {
+      arrivals.push(performance.now());
+      res.writeHead(204);
+      res.end();
+    });
+    const proxyUrl = await startProxy(upstream.origin, 100);
+
+    const startedAt = performance.now();
+    const response = await fetch(`${proxyUrl}/api/users`);
+
+    expect(response.status).toBe(204);
+    expect(arrivals).toHaveLength(1);
+    // Lower bound only, with slack for timer coarseness and loaded CI runners.
+    expect((arrivals[0] ?? 0) - startedAt).toBeGreaterThanOrEqual(75);
+  });
+
+  it('still forwards status, headers and body after the delay', async () => {
+    const upstream = await startUpstream((_req, res) => {
+      res.writeHead(201, { 'content-type': 'application/json', 'x-upstream': 'yes' });
+      res.end(JSON.stringify({ id: 7 }));
+    });
+    const proxyUrl = await startProxy(upstream.origin, 50);
+    const payload = JSON.stringify({ name: 'ada' });
+
+    const response = await fetch(`${proxyUrl}/api/users?page=2`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: payload,
+    });
+
+    expect(response.status).toBe(201);
+    expect(response.headers.get('content-type')).toBe('application/json');
+    expect(response.headers.get('x-upstream')).toBe('yes');
+    await expect(response.json()).resolves.toEqual({ id: 7 });
+
+    const recorded = upstream.requests[0];
+    expect(recorded?.method).toBe('POST');
+    expect(recorded?.url).toBe('/api/users?page=2');
+    expect(recorded?.body).toBe(payload);
+    expect(recorded?.headers.host).toBe(upstream.host);
+  });
+
+  it('never opens the upstream request when the client disconnects during the delay', async () => {
+    const latencyMs = 200;
+    const upstream = await startUpstream((_req, res) => {
+      res.writeHead(204);
+      res.end();
+    });
+    const proxy = createProxyServer({ target: upstream.origin, latencyMs });
+    // The proxy's own handler is registered first, so by the time this resolves
+    // the delay timer has already been started for this request.
+    const delayStarted = new Promise<void>((resolve) => {
+      proxy.once('request', () => {
+        resolve();
+      });
+    });
+    const { port } = await start(proxy);
+
+    const req = httpRequest(`http://127.0.0.1:${port}/api/users`);
+    req.on('error', () => {
+      // Expected: the client aborts itself below.
+    });
+    req.end();
+
+    await delayStarted;
+    req.destroy();
+
+    await sleep(latencyMs * 2);
+    expect(upstream.requests).toHaveLength(0);
+    // The stronger signal: without cancellation the proxy still dials upstream
+    // after the delay, even though the aborted body pipe stops the headers.
+    expect(upstream.connectionCount()).toBe(0);
   });
 });
