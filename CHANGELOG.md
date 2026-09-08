@@ -10,6 +10,24 @@ was never tagged and never published, so `1.0.0` is the first release.
 
 ## [Unreleased]
 
+## [1.0.2] - 2026-09-08
+
+### Changed
+
+- The npm package name is now `@igkougkousis/chaos-proxy`. The scope in `1.0.1` was
+  `@igkougkousis01`, which is the maintainer's GitHub username and not their npm one. npm scopes
+  are the account's, not GitHub's, and the only scope this account can publish under is
+  `@igkougkousis`. The previous name was never publishable, and nothing was ever published under
+  it.
+- The installed command is unchanged. `bin` names are not namespaced, so the executable is still
+  `chaos-proxy`, and every documented invocation works exactly as before. The package specifier is
+  the only thing that moved: `import { createProxyServer } from '@igkougkousis/chaos-proxy'`.
+
+Nothing about the proxy changed. No behaviour, no CLI flag, no public export, and no source file
+outside the packaging and its documentation. `1.0.1` stays exactly as it was tagged and released:
+it is a true record of what this project believed its package name to be at the time, and
+correcting a registry name is not a reason to rewrite a release that already exists.
+
 ## [1.0.1] - 2026-09-08
 
 ### Changed
@@ -68,6 +86,7 @@ the release history less true rather than more.
 - Request logging reports method, path, status, duration and outcome. Headers, cookies,
   authorization and bodies are never logged.
 
-[unreleased]: https://github.com/igkougkousis01/chaos-proxy/compare/v1.0.1...HEAD
+[unreleased]: https://github.com/igkougkousis01/chaos-proxy/compare/v1.0.2...HEAD
+[1.0.2]: https://github.com/igkougkousis01/chaos-proxy/compare/v1.0.1...v1.0.2
 [1.0.1]: https://github.com/igkougkousis01/chaos-proxy/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/igkougkousis01/chaos-proxy/releases/tag/v1.0.0

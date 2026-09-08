@@ -90,18 +90,20 @@ node dist/cli.js --target http://localhost:3000
 **Not available yet.** Nothing below works today; it is here so that the name is unambiguous when
 it does.
 
-The package will be published as `@igkougkousis01/chaos-proxy`. It is scoped because the unscoped
+The package will be published as `@igkougkousis/chaos-proxy`. It is scoped because the unscoped
 name on the registry is a different project by another maintainer, so installing `chaos-proxy`
-from npm will not give you this tool — now or later.
+from npm will not give you this tool — now or later. The scope is the maintainer's npm account
+name, which is not the same string as their GitHub one: the repository lives at
+`igkougkousis01/chaos-proxy` and the package is `@igkougkousis/chaos-proxy`.
 
 Once it is published, the install will be:
 
 ```bash
-npm install -g @igkougkousis01/chaos-proxy
+npm install -g @igkougkousis/chaos-proxy
 ```
 
 ```bash
-npx @igkougkousis01/chaos-proxy --target http://localhost:3000
+npx @igkougkousis/chaos-proxy --target http://localhost:3000
 ```
 
 and the command stays `chaos-proxy`, because npm does not namespace executables:
@@ -112,7 +114,7 @@ chaos-proxy --target http://localhost:3000
 
 | Thing          | Name                                                                          |
 | -------------- | ----------------------------------------------------------------------------- |
-| npm package    | `@igkougkousis01/chaos-proxy`                                                 |
+| npm package    | `@igkougkousis/chaos-proxy`                                                   |
 | CLI executable | `chaos-proxy`                                                                 |
 | GitHub repo    | [`igkougkousis01/chaos-proxy`](https://github.com/igkougkousis01/chaos-proxy) |
 
@@ -850,7 +852,7 @@ The forwarding layer is also available programmatically, and the CLI is a consum
 any other:
 
 ```ts
-import { createProxyServer } from '@igkougkousis01/chaos-proxy';
+import { createProxyServer } from '@igkougkousis/chaos-proxy';
 
 const server = createProxyServer({ target: 'http://localhost:5000' });
 
@@ -872,8 +874,8 @@ The proxy core prints nothing. Pass `onRequestComplete` to be told what happened
 that completed:
 
 ```ts
-import { createProxyServer } from '@igkougkousis01/chaos-proxy';
-import type { RequestLogEvent } from '@igkougkousis01/chaos-proxy';
+import { createProxyServer } from '@igkougkousis/chaos-proxy';
+import type { RequestLogEvent } from '@igkougkousis/chaos-proxy';
 
 const server = createProxyServer({
   target: 'http://localhost:5000',

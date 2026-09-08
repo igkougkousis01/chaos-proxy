@@ -43,9 +43,25 @@ describe('package manifest', () => {
     // Scoped, and not by preference: the unscoped `chaos-proxy` on the registry
     // belongs to another maintainer, and their `1.0.0` is already published and
     // immutable. docs/npm-publishing.md has the detail.
-    expect(manifest.name).toBe('@igkougkousis01/chaos-proxy');
+    expect(manifest.name).toBe('@igkougkousis/chaos-proxy');
     expect(manifest.license).toBe('MIT');
     expect(manifest.type).toBe('module');
+  });
+
+  it('scopes the package under the npm account, not the GitHub account', () => {
+    // The `1.0.1` bug, asserted so it cannot come back. npm scopes belong to
+    // npm accounts: `npm whoami` prints `igkougkousis`, and that is the only
+    // scope this account can publish into. `igkougkousis01` is the GitHub
+    // username, it is a valid-looking scope, and a package named after it fails
+    // only at `npm publish` — long after every doc and test has been written
+    // agreeing with it. The two strings differ by two characters, which is
+    // exactly the kind of difference a reviewer's eye slides over.
+    expect(manifest.name).toBe('@igkougkousis/chaos-proxy');
+    expect(manifest.name).not.toBe('@igkougkousis01/chaos-proxy');
+    expect(manifest.name as string).not.toMatch(/^@igkougkousis01\//);
+
+    const scope = (manifest.name as string).split('/')[0];
+    expect(scope).toBe('@igkougkousis');
   });
 
   it('points every URL at the real repository', () => {
@@ -66,7 +82,7 @@ describe('package manifest', () => {
   it('names the command after the tool, not after the scoped package', () => {
     // The most confusable fact about this package, so it is asserted rather
     // than left to a comment. `bin` names are not namespaced: the registry
-    // coordinate is `@igkougkousis01/chaos-proxy` and the command a consumer
+    // coordinate is `@igkougkousis/chaos-proxy` and the command a consumer
     // types is `chaos-proxy`. Renaming the binary to match the package would
     // invalidate every documented invocation, and would still be a valid
     // manifest — nothing but this would notice.
@@ -149,12 +165,21 @@ describe('licence', () => {
 describe('release version', () => {
   const version = manifest.version as string;
 
+  it('is the version this branch prepares', () => {
+    // Pinned deliberately. The scope correction and the version bump are one
+    // change: publishing `1.0.2` is the only way the corrected name reaches the
+    // registry, since `1.0.1` is already tagged and stays as it is.
+    expect(version).toBe('1.0.2');
+  });
+
   it('is stated identically in the lockfile', () => {
     // `npm ci` installs from the lockfile, and a lockfile that disagrees with
     // the manifest is a version the release workflow would verify but never
     // install. The name is checked alongside it because `npm pkg set name`
     // does not touch the lockfile: the rename can half-apply, and a lockfile
-    // still naming the unscoped package is exactly what that looks like.
+    // still naming the old scope is exactly what that looks like. It is not
+    // hypothetical — renaming to `@igkougkousis/chaos-proxy` left the lockfile
+    // on `@igkougkousis01` until `npm install --package-lock-only` ran.
     const lockfile = readJson('package-lock.json');
     const root = (lockfile.packages as Record<string, Record<string, unknown>>)[''];
 
@@ -420,6 +445,40 @@ describe('npm publication', () => {
     expect(doc).toMatch(/immutable/i);
   });
 
+  it('documents the npm scope as distinct from the GitHub username', () => {
+    // The two identities differ by two characters and are used in the same
+    // sentences throughout these docs. Recording *why* the scope is
+    // `@igkougkousis` while every URL says `igkougkousis01` is what stops the
+    // next person from "fixing" one to match the other.
+    const doc = readText('docs/npm-publishing.md');
+
+    expect(doc).toContain('@igkougkousis/chaos-proxy');
+    expect(doc).toMatch(/npm (username|account)/i);
+    expect(doc).toContain('igkougkousis01');
+    expect(doc).toMatch(/whoami/);
+  });
+
+  it('names the version the bootstrap publish will create', () => {
+    const doc = readText('docs/npm-publishing.md');
+    const checklist = readText('docs/release-checklist.md');
+    const version = manifest.version as string;
+
+    expect(doc).toContain(`${manifest.name as string}@${version}`);
+    expect(checklist).toContain(`${manifest.name as string}@${version}`);
+    expect(checklist).toContain(`v${version}`);
+  });
+
+  it('uses an explicit --access public for the first scoped publish', () => {
+    // `publishConfig` sets it too, but the bootstrap is a hand-typed command
+    // run once, and a scoped package that defaults to `restricted` publishes
+    // successfully and privately. Both docs state it on the command line.
+    for (const path of ['docs/npm-publishing.md', 'docs/release-checklist.md']) {
+      expect(readText(path), `${path} omits --access public`).toMatch(
+        /npm publish --access public/,
+      );
+    }
+  });
+
   it('documents that the first publish cannot come from CI', () => {
     // npm configures a trusted publisher in a package's settings, so a package
     // that does not exist yet cannot have one. The first version has to be
@@ -439,9 +498,10 @@ describe('npm publication', () => {
 
 describe('scoped tarball handling', () => {
   // Renaming the package changed the name of the file `npm pack` writes:
-  // `@igkougkousis01/chaos-proxy` packs as
-  // `igkougkousis01-chaos-proxy-1.0.1.tgz`, with the scope flattened rather
-  // than preserved. Anything that built that filename out of the package name
+  // `@igkougkousis/chaos-proxy` packs as `igkougkousis-chaos-proxy-1.0.2.tgz`,
+  // with the scope flattened rather than preserved — and it changed again when
+  // the scope was corrected in `1.0.2`, which is the second time in two
+  // versions that a hardcoded filename would have been wrong. Anything that built that filename out of the package name
   // would now build the wrong one, and would do it silently — the release
   // would simply attach nothing, or the smoke test would install a path that
   // does not exist. So nothing is allowed to construct it.
@@ -451,7 +511,8 @@ describe('scoped tarball handling', () => {
 
   it('names no tarball by hand in the release workflow', () => {
     // Every `.tgz` the workflow mentions has to be a glob. A literal filename
-    // here is the bug: `chaos-proxy-1.0.1.tgz` is the name this package used to
+    // here is the bug: `chaos-proxy-1.0.1.tgz` and
+    // `igkougkousis01-chaos-proxy-1.0.1.tgz` are both names this package used to
     // pack under and no longer does.
     const mentions = releaseSource.match(/\S*\.tgz/g) ?? [];
 
@@ -462,6 +523,7 @@ describe('scoped tarball handling', () => {
     }
 
     expect(releaseSource).not.toContain('chaos-proxy-');
+    expect(releaseSource).not.toContain('igkougkousis');
   });
 
   it('attaches exactly one tarball, and fails rather than attaching none', () => {
@@ -499,11 +561,22 @@ describe('scoped tarball handling', () => {
   it('keeps the package name and the binary name apart in the smoke test', () => {
     // The smoke test installs the tarball and then has to find the command.
     // Looking it up under the package name worked only while the two were the
-    // same string, and would now read `bin['@igkougkousis01/chaos-proxy']`,
+    // same string, and would now read `bin['@igkougkousis/chaos-proxy']`,
     // which is undefined.
     expect(smokeSource).toContain("const BIN_NAME = 'chaos-proxy'");
     expect(smokeSource).toContain('installedManifest.bin[BIN_NAME]');
     expect(smokeSource).not.toContain('installedManifest.bin[name]');
+  });
+
+  it('imports the consumer probe under the manifest name, never a written-down scope', () => {
+    // The smoke test's isolated consumer imports `${name}`, read from the
+    // manifest it just packed, so it followed the scope correction without
+    // being edited. A literal specifier here would be a second place the
+    // package name is stated — and the one place that would keep passing while
+    // naming a package that cannot be published.
+    expect(smokeSource).toContain("`import { createProxyServer } from '${name}';`");
+    expect(smokeSource).not.toContain("from '@igkougkousis01/chaos-proxy'");
+    expect(smokeSource).not.toMatch(/from '@igkougkousis\/chaos-proxy'/);
   });
 });
 
@@ -541,6 +614,44 @@ describe('repository hygiene', () => {
     const readme = readText('README.md');
 
     expect(readme).toMatch(/not (yet )?(on npm|published)/i);
-    expect(readme).toContain('@igkougkousis01/chaos-proxy');
+    expect(readme).toContain('@igkougkousis/chaos-proxy');
+  });
+
+  it('says it in the install section itself, not only in passing elsewhere', () => {
+    // The assertion above is satisfied by any sentence anywhere in a 40kB
+    // README, and two early ones satisfy it. So flipping the `### From npm`
+    // heading to claim availability leaves the file contradicting itself and
+    // the check above still passing — which was true until this test existed.
+    // The claim that matters is the one directly above the `npm install` line a
+    // reader is about to copy, so that is what is asserted.
+    const readme = readText('README.md');
+    const section = /^### From npm$([\s\S]*?)(?=^## )/m.exec(readme)?.[1];
+
+    expect(section, 'README has no `### From npm` section').toBeDefined();
+    expect(section ?? '').toMatch(/not available yet/i);
+    expect(section ?? '').toContain('npm install -g @igkougkousis/chaos-proxy');
+  });
+
+  it('advertises the npm package under the scope that can actually be published', () => {
+    // Every install line, the identity table and both import examples. The old
+    // scope surviving anywhere would hand a reader a specifier that resolves to
+    // nothing, and would do it in the one document strangers read first.
+    const readme = readText('README.md');
+
+    expect(readme).not.toContain('@igkougkousis01/chaos-proxy');
+    expect(readme).toContain('npm install -g @igkougkousis/chaos-proxy');
+    expect(readme).toContain("import { createProxyServer } from '@igkougkousis/chaos-proxy';");
+  });
+
+  it('keeps the GitHub identity out of the rename', () => {
+    // The correction is to the npm scope alone. The repository did not move,
+    // and rewriting these URLs to match the package would break every link.
+    const readme = readText('README.md');
+
+    expect(readme).toContain('https://github.com/igkougkousis01/chaos-proxy');
+    expect(manifest.repository).toEqual({
+      type: 'git',
+      url: 'git+https://github.com/igkougkousis01/chaos-proxy.git',
+    });
   });
 });

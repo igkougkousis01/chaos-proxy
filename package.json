@@ -1,6 +1,6 @@
 {
-  "name": "@igkougkousis01/chaos-proxy",
-  "version": "1.0.1",
+  "name": "@igkougkousis/chaos-proxy",
+  "version": "1.0.2",
   "description": "A local developer proxy that deliberately degrades communication between an application and an API, so you can test resilience.",
   "keywords": [
     "chaos-engineering",
