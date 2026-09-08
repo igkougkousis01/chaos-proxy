@@ -36,7 +36,7 @@ const WAIT_TIMEOUT_MS = 60_000;
 /**
  * The command the package installs, which is deliberately not the package name.
  *
- * The package is scoped — `@igkougkousis01/chaos-proxy` — because the unscoped
+ * The package is scoped — `@igkougkousis/chaos-proxy` — because the unscoped
  * registry name belongs to someone else. `bin` names are not namespaced, so the
  * executable a consumer gets is still `chaos-proxy`. Every lookup below that
  * concerns the binary uses this rather than the manifest name, and the checks
@@ -251,9 +251,11 @@ async function main() {
     // The filename comes from `--json` rather than from the last line of
     // stdout, because for a scoped package it is not derivable from the name
     // by any rule worth encoding here: npm flattens the scope, so
-    // `@igkougkousis01/chaos-proxy` packs as
-    // `igkougkousis01-chaos-proxy-1.0.1.tgz`. npm already knows what it wrote;
-    // asking it is the only answer that cannot drift.
+    // `@igkougkousis/chaos-proxy` packs as
+    // `igkougkousis-chaos-proxy-1.0.2.tgz`. npm already knows what it wrote;
+    // asking it is the only answer that cannot drift. The scope correction in
+    // `1.0.2` changed that filename and this script needed no edit, which is
+    // the argument for asking rather than constructing, made once in anger.
     const packed = await runOrThrow('npm', ['pack', '--json', '--pack-destination', workspace], {
       cwd: repoRoot,
     });

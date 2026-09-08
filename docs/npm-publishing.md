@@ -6,21 +6,40 @@ one manual step npm requires before publication can be automated.
 ## The name
 
 ```
-@igkougkousis01/chaos-proxy
+@igkougkousis/chaos-proxy
 ```
 
 Scoped, and settled. The unscoped package name `chaos-proxy` is already owned by another npm user,
-so this project publishes under the scope instead.
+so this project publishes under a scope instead.
 
-That is the whole of it as far as consumers are concerned. What matters more, and is easy to get
-wrong, is that only the _package_ is scoped:
+**The scope is the maintainer's npm username, `igkougkousis`, which is not the GitHub username.**
+That is the correction `1.0.2` exists to make. npm scopes belong to npm accounts; an account can
+only publish into the scope matching its own name (or an org it belongs to), and no amount of
+matching the GitHub identity changes that. `1.0.1` named the package `@igkougkousis01/chaos-proxy`
+after the GitHub username, which is a scope this account does not own and cannot publish into.
 
-| Thing             | Name                                              |
-| ----------------- | ------------------------------------------------- |
-| npm package       | `@igkougkousis01/chaos-proxy`                     |
-| CLI executable    | `chaos-proxy`                                     |
-| GitHub repository | `igkougkousis01/chaos-proxy`                      |
-| Import specifier  | `import { … } from '@igkougkousis01/chaos-proxy'` |
+`npm whoami` is the authority on which scope is available, and it prints:
+
+```
+igkougkousis
+```
+
+So there are two identities in play, they differ by two characters, and confusing them is the
+whole of the bug being fixed here:
+
+| Identity          | Value            | Where it applies                                        |
+| ----------------- | ---------------- | ------------------------------------------------------- |
+| npm account/scope | `igkougkousis`   | The package name, and only the package name             |
+| GitHub user/repo  | `igkougkousis01` | Clone URLs, issue links, the trusted-publisher settings |
+
+What matters beyond that, and is equally easy to get wrong, is that only the _package_ is scoped:
+
+| Thing             | Name                                            |
+| ----------------- | ----------------------------------------------- |
+| npm package       | `@igkougkousis/chaos-proxy`                     |
+| CLI executable    | `chaos-proxy`                                   |
+| GitHub repository | `igkougkousis01/chaos-proxy`                    |
+| Import specifier  | `import { … } from '@igkougkousis/chaos-proxy'` |
 
 `bin` names are not namespaced, so a globally installed package still puts a plain `chaos-proxy` on
 the `PATH`, and every documented invocation is unchanged. Renaming the binary to match the package
@@ -46,15 +65,22 @@ nothing and makes no version number available again.
 A scoped package sidesteps all of it: the scope belongs to the account, and nothing is published in
 it yet.
 
-## Why `1.0.1` and not `1.0.0`
+## Why `1.0.2` and not a re-cut `1.0.1`
 
-`v1.0.0` is already tagged here and already released on GitHub, with a verified artifact attached.
-It stays exactly as it is. Retagging a released version to correct a registry name would trade a
-true release history for a tidier-looking one.
+`v1.0.0` and `v1.0.1` are both already tagged here and already released on GitHub, with verified
+artifacts attached. They stay exactly as they are. Retagging a released version to correct a
+registry name would trade a true release history for a tidier-looking one, and `git show
+v1.0.1:package.json` should keep saying `@igkougkousis01/chaos-proxy` — that is what this project
+believed at the time, and it is a fact about the release rather than a mistake to be erased.
 
-So the first npm publication is `@igkougkousis01/chaos-proxy@1.0.1`, and `1.0.1` exists for that
-reason alone. It fixes no bug and changes no behaviour — the only difference from `1.0.0` is the
-name the package is published under, and the docs and packaging checks that follow from it.
+Nothing was published under the wrong name, so there is no registry state to undo. The publish
+attempt for `@igkougkousis01/chaos-proxy@1.0.1` failed, which is exactly what an unowned scope
+does, and a failed publish creates no package: `npm view @igkougkousis01/chaos-proxy` returns
+`E404`. Only the repository was ever wrong.
+
+So the first npm publication is `@igkougkousis/chaos-proxy@1.0.2`, and `1.0.2` exists for that
+reason alone. It fixes no bug and changes no behaviour — the only difference from `1.0.1` is the
+scope the package is published under, and the docs and packaging checks that follow from it.
 
 ## The bootstrap problem
 
@@ -99,8 +125,11 @@ npm login
 npm whoami
 ```
 
-`npm whoami` must print the account that owns the `@igkougkousis01` scope. Keep 2FA enabled — npm
-will prompt for it at publish time, and that prompt is the point.
+`npm whoami` must print `igkougkousis`, the account that owns the `@igkougkousis` scope. This is
+the check that `1.0.1` was missing: run it _before_ the publish rather than discovering the scope
+mismatch from a rejection. If it prints anything else, the publish below will fail, and no amount
+of retrying will change that — fix the login first. Keep 2FA enabled — npm will prompt for it at
+publish time, and that prompt is the point.
 
 No token is created, stored, or copied into repository settings for any of this. The entire reason
 for moving to a trusted publisher afterwards is that no long-lived credential has to exist.
@@ -112,21 +141,29 @@ the tag is not part of the release, and the artifact must be built from what was
 
 ```bash
 git clone https://github.com/igkougkousis01/chaos-proxy /tmp/publish-checkout
-cd /tmp/publish-checkout && git checkout v1.0.1
+cd /tmp/publish-checkout && git checkout v1.0.2
 npm ci
-npm publish --dry-run   # inspect first
-npm publish
+npm whoami                          # igkougkousis, before anything else
+npm publish --dry-run --access public   # inspect first
+npm publish --access public
 ```
+
+`--access public` is passed explicitly rather than left to `publishConfig`. The manifest sets it
+too, and either alone is sufficient — but this is the one publish where a silent default to
+`restricted` would be least recoverable, and stating it on the command line means the intent is
+visible in the shell history of the one command that mattered.
 
 `prepack` rebuilds `dist/` as part of packing, so a stale build cannot ship.
 
-Two things to check in the `--dry-run` output before running the real thing:
+Three things to check in the `--dry-run` output before running the real thing:
 
-- the package is `@igkougkousis01/chaos-proxy@1.0.1`, and access is `public` — `publishConfig` in
-  the manifest sets that, and without it npm would default a scoped package to restricted and
-  publish it privately without complaining;
-- the tarball is `igkougkousis01-chaos-proxy-1.0.1.tgz`. npm flattens the scope into the filename
-  rather than preserving it, which is worth knowing before it surprises a script.
+- the package is `@igkougkousis/chaos-proxy@1.0.2` — with one `igkougkousis`, not the GitHub
+  `igkougkousis01`, which is the entire subject of this version;
+- access is `public` — `publishConfig` in the manifest sets that, and without it npm would default
+  a scoped package to restricted and publish it privately without complaining;
+- the tarball is `igkougkousis-chaos-proxy-1.0.2.tgz`. npm flattens the scope into the filename
+  rather than preserving it, which is worth knowing before it surprises a script. Nothing in this
+  repository constructs that name — `npm pack --json` is asked for it — and nothing should start.
 
 ## 2. Configure the trusted publisher
 
@@ -145,9 +182,10 @@ The fields npm asks for:
 | Workflow filename    | `publish.yml`                           |
 | Environment          | `npm`, if the environment below is used |
 
-The repository is the GitHub one and is not scoped — only the package name is. The workflow filename
-is part of the trust relationship, so it has to be decided before this step and cannot drift
-afterwards without updating the publisher.
+The repository is the GitHub one, so every value in that table is `igkougkousis01` — the trusted
+publisher describes where the code is, not what the package is called. The package name is the only
+place `@igkougkousis` appears. The workflow filename is part of the trust relationship, so it has
+to be decided before this step and cannot drift afterwards without updating the publisher.
 
 ## 3. Create the `npm` GitHub Environment
 
@@ -213,24 +251,24 @@ Points that are decisions rather than boilerplate:
 Only once the package actually exists. Confirm the registry agrees with the release:
 
 ```bash
-npm view @igkougkousis01/chaos-proxy version
-npm view @igkougkousis01/chaos-proxy dist-tags
-npm view @igkougkousis01/chaos-proxy repository
+npm view @igkougkousis/chaos-proxy version
+npm view @igkougkousis/chaos-proxy dist-tags
+npm view @igkougkousis/chaos-proxy repository
 ```
 
 Then, in a clean directory outside the repository, prove a stranger's install works:
 
 ```bash
 cd "$(mktemp -d)" && npm init -y
-npm install @igkougkousis01/chaos-proxy@1.0.1
-node -e "import('@igkougkousis01/chaos-proxy').then(m => console.log(Object.keys(m)))"
+npm install @igkougkousis/chaos-proxy@1.0.2
+node -e "import('@igkougkousis/chaos-proxy').then(m => console.log(Object.keys(m)))"
 ```
 
 and the global CLI install, which is where the package/binary distinction shows up in practice:
 
 ```bash
-npm install -g @igkougkousis01/chaos-proxy@1.0.1
-chaos-proxy --version   # 1.0.1
+npm install -g @igkougkousis/chaos-proxy@1.0.2
+chaos-proxy --version   # 1.0.2
 chaos-proxy --help
 ```
 

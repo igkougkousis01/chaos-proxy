@@ -433,9 +433,11 @@ event as well as the tag. That condition is deliberately narrower than the one g
 check, so a run that creates a release has always verified the tag first — a property a test
 asserts rather than two conditions that happen to match. It is the only workflow with write
 permission, and it holds no npm token: publishing to the registry is a deliberate manual step for
-now. The package is `@igkougkousis01/chaos-proxy` — scoped, because the unscoped name on npm is
-someone else's project — and it has never been published, which is precisely why the first publish
-cannot be automated: npm grants a trusted publisher only to a package that already exists.
+now. The package is `@igkougkousis/chaos-proxy` — scoped, because the unscoped name on npm is
+someone else's project, and scoped under the maintainer's _npm_ username rather than their GitHub
+one, which is the difference `1.0.2` exists to correct — and it has never been published, which is
+precisely why the first publish cannot be automated: npm grants a trusted publisher only to a
+package that already exists.
 `docs/npm-publishing.md` has the sequence.
 
 The version in the manifest is bumped in its own commit immediately before the tag, never as part
