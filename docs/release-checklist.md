@@ -1,9 +1,13 @@
 # Release checklist
 
 For maintainers. How a release is cut, from a merged version bump to a GitHub Release with a
-tarball attached. `1.0.0` and `1.0.1` are cut; `1.0.2` is the next, and is also the one that
-bootstraps npm publication — see [the one-time npm bootstrap](#the-one-time-npm-bootstrap-for-102)
-below.
+tarball attached and the package on npm.
+
+`1.0.0`, `1.0.1` and `1.0.2` are cut. `1.0.2` is the first version on the registry: it was
+published by hand, because npm cannot grant a trusted publisher to a package that does not exist
+yet. That bootstrap has run and is not repeated — the record of it is in
+[npm publishing](npm-publishing.md). From `1.0.3` onwards, publication is a step in the pipeline
+rather than a step in this document.
 
 ## Why the version is not bumped in a hardening PR
 
@@ -31,10 +35,12 @@ reviewable change immediately before the tag.
    globs, correcting the scope in `1.0.2` needed no change to it at all — which is the point of
    never writing that filename down. Attach npm's own artifact under npm's own name; do not
    rename it.
-6. **Publish to npm.** Not automated, and deliberately so for the first version — npm cannot grant
-   a trusted publisher to a package that does not exist yet. For `1.0.2` that is the one-time
-   bootstrap below. Afterwards it becomes a CI job over OIDC, with no token. See
-   [npm publishing](npm-publishing.md) for the full reasoning.
+6. **The publish workflow runs**, triggered by that GitHub Release being published.
+   `.github/workflows/publish.yml` checks out the exact release tag — not `main` — verifies the tag
+   against the manifest again, refuses if that version is already on the registry, re-runs the
+   quality gate and the package smoke test, and publishes with `npm publish --access public` over
+   OIDC. No npm token is used or stored. Nothing to do by hand: watch the run, and check the
+   package page afterwards. See [npm publishing](npm-publishing.md) for the full reasoning.
 
 ## Rehearsing it
 
@@ -55,7 +61,7 @@ matter which branch or tag it is started from — only a pushed `v*` tag creates
 - [ ] `npm run package:smoke` passes
 - [ ] `npm audit` reviewed — findings understood, not silenced
 - [ ] `npm outdated` reviewed — upgrades are their own PRs, not part of a release
-- [ ] README is current, and claims nothing that is not true yet (npm availability especially)
+- [ ] README is current, and claims nothing that is not true yet
 - [ ] CHANGELOG has an entry for every user-visible change, under the version being released
 - [ ] Version bumped in `package.json`, with `package-lock.json` agreeing
 - [ ] `npm pack --dry-run` contents inspected — only `dist/`, `examples/`, `README.md`, `LICENSE`
@@ -73,35 +79,39 @@ matter which branch or tag it is started from — only a pushed `v*` tag creates
 
 - [ ] GitHub Release exists, with the `.tgz` attached
 - [ ] The attached tarball installs in a clean project
+- [ ] The publish workflow ran and succeeded, in the `npm` environment
+- [ ] `npm view @igkougkousis/chaos-proxy version` returns the version just released
+- [ ] `npm view @igkougkousis/chaos-proxy dist-tags` has `latest` on it
+- [ ] A clean project outside the repository installs it and imports `createProxyServer`
+- [ ] `npm install -g @igkougkousis/chaos-proxy` puts a `chaos-proxy` command on `PATH`, and
+      `chaos-proxy --version` prints the released version
+- [ ] The package page shows the release as built from `igkougkousis01/chaos-proxy` by
+      `publish.yml` — the provenance npm attaches automatically to an OIDC publish
 - [ ] A fresh `## [Unreleased]` section opened in `CHANGELOG.md`
 
-## The one-time npm bootstrap, for `1.0.2`
+## npm publication: what is automated, and what is not
 
-This runs once, ever, and only after the GitHub Release above exists. It is separate from the
-checklist above because none of it is part of cutting a release: it is what makes the package exist
-on the registry so that every later release can publish itself.
+The one-time bootstrap that put `@igkougkousis/chaos-proxy@1.0.2` on the registry has run. It is
+recorded in [npm publishing](npm-publishing.md) and is not repeated: npm versions are immutable,
+and there is no second first publish.
 
-The full reasoning — why the name is scoped, why the first publish cannot come from CI, and what
-the trusted publisher needs — is in [npm publishing](npm-publishing.md). The order:
+What is automated, from `1.0.3` onwards, is everything. `.github/workflows/publish.yml` fires on
+the GitHub Release from step 5, checks out that exact tag, re-verifies tag against manifest,
+refuses a version the registry already has, re-runs the full gate and the package smoke test, and
+publishes over OIDC. There is no npm token in this repository and none is needed.
 
-- [ ] `npm logout && npm login`, then `npm whoami` returns `igkougkousis` — the npm account, which
-      is not the GitHub username `igkougkousis01`, and is the only scope this account can publish
-      into. Checking this first is what `1.0.1` skipped
-- [ ] Clean checkout of the tag, not of `main`: `git checkout v1.0.2` in a fresh clone or worktree
-- [ ] `npm ci`
-- [ ] `npm publish --dry-run --access public` — confirm `@igkougkousis/chaos-proxy@1.0.2`, access
-      `public`, and the file list
-- [ ] `npm publish --access public` — explicit for the first scoped publish, so a default to
-      `restricted` cannot publish it privately. 2FA prompts, and stays enabled
-- [ ] `npm view @igkougkousis/chaos-proxy version` returns `1.0.2`
-- [ ] `npm view @igkougkousis/chaos-proxy dist-tags` has `latest` on `1.0.2`
-- [ ] A clean project outside the repository installs it and imports `createProxyServer`
-- [ ] `npm install -g @igkougkousis/chaos-proxy@1.0.2` puts a `chaos-proxy` command on `PATH`,
-      and `chaos-proxy --version` prints `1.0.2`
-- [ ] Configure the npm trusted publisher on the now-existing package
-- [ ] README updated to say the package is on npm — it currently says it is not, and that is the
-      last thing to change, not the first
-- [ ] `.github/workflows/publish.yml` added in a follow-up PR, over OIDC, with no token
+What is **not** automated, and cannot be, is the trust configuration that makes it work. Both are
+one-time, both are done in a browser, and both are outstanding until someone does them:
 
-After that, publication is part of the release rather than an appendix to it, and this section can
-go.
+- [ ] The GitHub Environment `npm` exists (repository Settings → Environments), optionally with a
+      required reviewer so publication pauses for approval
+- [ ] The npm trusted publisher is configured on the package: owner `igkougkousis01`, repository
+      `chaos-proxy`, workflow `publish.yml`, environment `npm` — every value the GitHub identity,
+      never the `@igkougkousis` npm scope
+
+Until both are done, the publish workflow runs, passes every check, and is rejected at
+`npm publish`. That is the intended failure: visible, and at the last possible moment, rather than
+a quiet fallback to some other credential.
+
+Renaming `publish.yml` breaks publication until the trusted publisher is updated to match. The
+filename is part of the trust relationship, not an implementation detail.

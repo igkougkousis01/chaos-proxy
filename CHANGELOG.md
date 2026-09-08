@@ -10,6 +10,31 @@ was never tagged and never published, so `1.0.0` is the first release.
 
 ## [Unreleased]
 
+### Added
+
+- npm publication is automated. `.github/workflows/publish.yml` runs when a GitHub Release is
+  published, checks out that exact tag, and publishes over GitHub Actions OIDC using npm trusted
+  publishing. No npm token exists in this repository and none is required. It is the only workflow
+  permitted to run `npm publish`; a test asserts that every other one still cannot.
+- `scripts/verify-publishable.mjs`, the guard the publish workflow runs immediately before
+  publishing: it refuses a manifest whose package name is not the expected one, refuses a version
+  the registry already has — npm versions are immutable — and refuses to proceed at all when the
+  registry cannot be reached, rather than reading an unreachable registry as an available version.
+  Available as `npm run release:verify-publishable`.
+
+### Changed
+
+- The README documents installing from npm, because the package is now on npm.
+  `@igkougkousis/chaos-proxy@1.0.2` was published on 2026-09-08 — by hand, since npm grants a
+  trusted publisher only to a package that already exists, so the first publish could not come
+  from CI. Every version after it publishes itself.
+- `docs/npm-publishing.md` and `docs/release-checklist.md` describe automated publication and the
+  two one-time settings it depends on — the `npm` GitHub Environment, and the npm trusted publisher
+  naming `igkougkousis01/chaos-proxy` and `publish.yml`.
+
+No version is released here, and nothing about the proxy changed: no behaviour, no CLI flag, no
+public export, and no file under `src/`.
+
 ## [1.0.2] - 2026-09-08
 
 ### Changed
