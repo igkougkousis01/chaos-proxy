@@ -5,25 +5,23 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Node.js >= 22.12](https://img.shields.io/badge/node-%3E%3D22.12-brightgreen.svg)](#requirements)
 
-A local developer tool for testing how an application behaves when its API misbehaves.
+A developer-focused HTTP chaos proxy for testing retries, loading states, timeouts, and error
+handling locally.
 
-> Chaos Proxy runs from the command line and can forward HTTP traffic to a target API, inject a
-> fixed artificial latency, inject synthetic HTTP errors, inject synthetic timeouts, and abruptly
-> reset client connections — globally, or per endpoint through a YAML config file — printing one
-> line per request as it goes. A `chaos.yml` in the working directory is picked up automatically,
-> and `--print-config` shows the configuration a run would use without starting anything. Named
-> presets cover the common scenarios, and `--seed` makes a run reproducible. Refusing connections
-> outright and mid-stream failures do not exist yet.
-
-Chaos Proxy sits between an application and an API and deliberately degrades that connection, so
-that loading states, retries, error handling, and timeout behaviour can be exercised locally.
+Chaos Proxy sits between an application and the API it calls, forwarding traffic upstream while
+injecting fixed latency, synthetic HTTP errors, synthetic timeouts, and abrupt connection resets —
+globally, or per endpoint through a YAML config file. Every request prints one line saying what
+happened to it, and `--seed` makes a run reproducible, so an interesting failure can be looked at
+twice.
 
 ## Quickstart
 
-Run it without installing anything ([full install instructions](#install)):
+Run it without installing anything:
 
 ```bash
-npx @igkougkousis/chaos-proxy --target http://localhost:3000 --preset flaky-api
+npx @igkougkousis/chaos-proxy \
+  --target http://localhost:3000 \
+  --preset flaky-api
 ```
 
 ```text
@@ -34,20 +32,91 @@ Error injection: 25% -> 503
 Press Ctrl+C to stop.
 ```
 
-Send requests to `http://127.0.0.1:4000` instead of your upstream. One in four now fails with
+Point your application at `http://127.0.0.1:4000` instead of the upstream: traffic is forwarded to
+the target with the selected failures injected on the way. One request in four now fails with
 `503`, and every request prints a line saying what happened to it. `Ctrl+C` stops the proxy,
 letting requests in flight finish.
 
-Three things worth knowing before anything else:
+After a global [install](#install) the same command is `chaos-proxy`.
 
-- `--preset` covers the common scenarios, so nothing has to be memorised — see [Presets](#presets).
-- A `chaos.yml` in the directory you run from is [loaded automatically](#conventional-config-file),
-  with no flag at all.
-- `--print-config` shows [exactly what a run would do](#inspecting-the-configuration) without
-  starting anything, and `--seed` makes a run [repeatable](#reproducible-runs).
+## What it can simulate
 
-After a global install (below), every command here is `chaos-proxy` rather than
-`npx @igkougkousis/chaos-proxy`. The package is scoped; the command is not.
+| Behaviour                                     | Configured with                                      |
+| --------------------------------------------- | ---------------------------------------------------- |
+| A fixed delay on every request                | [`--latency`](#latency-injection)                    |
+| Synthetic HTTP errors, at a chosen status     | [`--error-rate`, `--error-status`](#error-injection) |
+| Requests held open and then failed with `504` | [`--timeout-rate`, `--timeout`](#timeout-injection)  |
+| Client connections reset without a response   | [`--reset-rate`](#connection-reset-injection)        |
+| Different behaviour per endpoint              | [ordered path rules in `chaos.yml`](#config-file)    |
+| Named scenarios instead of remembered numbers | [`--preset`](#presets)                               |
+| The same chaos decisions on the next run      | [`--seed`](#reproducible-runs)                       |
+| One log line per completed request            | [request output](#request-output)                    |
+| The settled configuration, without running it | [`--print-config`](#inspecting-the-configuration)    |
+
+A `chaos.yml` in the directory you run from is [picked up automatically](#conventional-config-file),
+with no flag at all.
+
+## How it works
+
+Chaos is applied in a fixed order, and each request receives **at most one** injected outcome:
+
+```text
+application
+    |
+    v
+Chaos Proxy
+    |
+    +-- latency delay ......... every request waits
+    |
+    +-- reset?   -- yes --> connection destroyed, no HTTP response
+    |
+    +-- timeout? -- yes --> held open, then 504
+    |
+    +-- error?   -- yes --> injected status, e.g. 503
+    |
+    v
+target API ................ forwarded, and streamed back unchanged
+```
+
+A request the reset decision declines is offered to the timeout decision, and one both decline is
+offered to the error decision, so the rates are sequential rather than independent — see
+[Ordering](#ordering).
+
+## Engineering highlights
+
+- **Streaming HTTP/HTTPS forwarding on Node's native `http` stack**, with no proxy framework.
+  Request and response bodies stream through rather than being buffered, and hop-by-hop headers
+  are dropped per message rather than copied blindly.
+- **Deterministic chaos.** One seeded generator per run, drawn from in a documented decision order,
+  so a scenario can be replayed — with the [limits of that promise](#what-is-and-is-not-promised)
+  written down rather than implied.
+- **One place decides what a run does.** CLI flags beat `--preset`, which beats the config file,
+  which beats built-in defaults; endpoint rules are first-match; and `--print-config` prints the
+  settled result without opening a listener.
+- **Failure modes designed rather than bolted on:** at most one injected outcome per request, a
+  reset that reports no status because the client never received one, and a client that
+  disconnects mid-delay cancelling the work behind it.
+- **Local by construction.** The listener binds `127.0.0.1` and that is not configurable, and
+  `SIGINT`/`SIGTERM` stop new connections while in-flight requests finish.
+- **Behaviour is covered by an extensive deterministic test suite**, plus a smoke test that packs
+  the package, installs the tarball into a throwaway project outside the repository, and drives
+  the installed CLI and library — on both Linux and macOS in CI.
+- **Release and publish are automated.** A `v*` tag checks itself against the manifest, runs the
+  full gate and creates the GitHub Release; npm publishing uses Trusted Publishing over GitHub
+  OIDC, so no long-lived publish token exists.
+
+## Contents
+
+- [Requirements](#requirements) and [Install](#install)
+- [Usage](#usage) — options, startup summary, errors, request output
+- [Latency](#latency-injection), [errors](#error-injection), [timeouts](#timeout-injection) and
+  [connection resets](#connection-reset-injection)
+- [Presets](#presets)
+- [Config file](#config-file) — endpoint rules, discovery, `--print-config`
+- [Reproducible runs](#reproducible-runs)
+- [Programmatic API](#programmatic-api)
+- [Development](#development)
+- [Project status](#project-status)
 
 ## Requirements
 
@@ -91,7 +160,7 @@ npm install @igkougkousis/chaos-proxy
 import { createProxyServer } from '@igkougkousis/chaos-proxy';
 ```
 
-See [Proxy core](#proxy-core) for what that gives you.
+See the [programmatic API](#programmatic-api) for what that gives you.
 
 **Install the scoped name, not the bare one.** `chaos-proxy` on the registry is a different
 project by another maintainer, so `npm install chaos-proxy` will not give you this tool. The scope
@@ -847,7 +916,7 @@ else. Environment variables and `${VAR}` interpolation, other file names, parent
 home-directory lookup, JSON and TOML config, remote config, multiple files, includes, inheritance,
 hot reload, and commands that write or migrate a config file are all unsupported.
 
-## Proxy core
+## Programmatic API
 
 The forwarding layer is also available programmatically, and the CLI is a consumer of it.
 `createProxyServer` returns a standard Node.js `http.Server`, so it is started and stopped like
@@ -968,6 +1037,12 @@ capabilities.
 | Request logging     | One line per completed request       |
 | Reproducibility     | `--seed`, per request sequence       |
 | Other chaos         | Not started                          |
+
+Chaos Proxy degrades a connection it forwards over, and decides before forwarding begins.
+Refusing connections outright, failing part-way through a request body or a response, half-open
+sockets, bandwidth throttling and packet-level chaos are not implemented. Each section above ends
+with the limits of the particular knob it describes; [Ordering](#ordering) covers what a reset
+does and does not do.
 
 ## Contributing and support
 
