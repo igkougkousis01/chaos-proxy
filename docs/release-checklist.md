@@ -1,6 +1,7 @@
 # Release checklist
 
-For maintainers. Chaos Proxy has not been released yet; the first public release will be `1.0.0`.
+For maintainers. How a release is cut, from a merged version bump to a GitHub Release with a
+tarball attached. `1.0.0` is the first.
 
 ## Why the version is not bumped in a hardening PR
 
@@ -13,9 +14,10 @@ reviewable change immediately before the tag.
 ## The sequence
 
 1. **Merge the hardening work** into `main`, with the version untouched.
-2. **Bump the version** in `package.json` in a dedicated PR — `0.1.0` to `1.0.0` for the first
-   release — and move the `## [Unreleased]` entries in `CHANGELOG.md` under a `## [1.0.0]` heading
-   with the release date. Nothing else belongs in that PR.
+2. **Bump the version** in a dedicated PR: `npm version <x.y.z> --no-git-tag-version`, which
+   updates `package.json` and `package-lock.json` together and creates neither a commit nor a tag.
+   Move the `## [Unreleased]` entries in `CHANGELOG.md` under a `## [x.y.z]` heading with the
+   release date, leaving `## [Unreleased]` above it, empty. Nothing else belongs in that PR.
 3. **Wait for CI to pass** on `main` after it merges.
 4. **Tag it**: `git tag v1.0.0 && git push origin v1.0.0`. The tag must match the manifest exactly;
    `scripts/verify-release-tag.mjs` fails the release workflow if it does not.
@@ -48,7 +50,7 @@ matter which branch or tag it is started from — only a pushed `v*` tag creates
 - [ ] `npm outdated` reviewed — upgrades are their own PRs, not part of a release
 - [ ] README is current, and claims nothing that is not true yet (npm availability especially)
 - [ ] CHANGELOG has an entry for every user-visible change, under the version being released
-- [ ] Version bumped in `package.json`
+- [ ] Version bumped in `package.json`, with `package-lock.json` agreeing
 - [ ] `npm pack --dry-run` contents inspected — only `dist/`, `examples/`, `README.md`, `LICENSE`
       and `package.json`
 - [ ] The packed tarball installs and runs in a clean project outside the repository — this is
