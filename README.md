@@ -87,12 +87,38 @@ node dist/cli.js --target http://localhost:3000
 
 ### From npm
 
-Not available yet. There is no `chaos-proxy` package on the registry to install, so do not expect
-`npm install -g chaos-proxy` to give you this tool. Publishing to the registry is a separate step
-from cutting a release, and it has not happened: when it does, this section will say so and the
-command will be here. Until then, the clone above is the only way to get it. See
+**Not available yet.** Nothing below works today; it is here so that the name is unambiguous when
+it does.
+
+The package will be published as `@igkougkousis01/chaos-proxy`. It is scoped because the unscoped
+name on the registry is a different project by another maintainer, so installing `chaos-proxy`
+from npm will not give you this tool — now or later.
+
+Once it is published, the install will be:
+
+```bash
+npm install -g @igkougkousis01/chaos-proxy
+```
+
+```bash
+npx @igkougkousis01/chaos-proxy --target http://localhost:3000
+```
+
+and the command stays `chaos-proxy`, because npm does not namespace executables:
+
+```bash
+chaos-proxy --target http://localhost:3000
+```
+
+| Thing          | Name                                                                          |
+| -------------- | ----------------------------------------------------------------------------- |
+| npm package    | `@igkougkousis01/chaos-proxy`                                                 |
+| CLI executable | `chaos-proxy`                                                                 |
+| GitHub repo    | [`igkougkousis01/chaos-proxy`](https://github.com/igkougkousis01/chaos-proxy) |
+
+Until publication, the clone above is the only way to get it. See
 [docs/release-checklist.md](docs/release-checklist.md) for where publishing sits in the release
-process.
+process, and [docs/npm-publishing.md](docs/npm-publishing.md) for why it has not happened yet.
 
 ## Usage
 
@@ -824,7 +850,7 @@ The forwarding layer is also available programmatically, and the CLI is a consum
 any other:
 
 ```ts
-import { createProxyServer } from 'chaos-proxy';
+import { createProxyServer } from '@igkougkousis01/chaos-proxy';
 
 const server = createProxyServer({ target: 'http://localhost:5000' });
 
@@ -846,8 +872,8 @@ The proxy core prints nothing. Pass `onRequestComplete` to be told what happened
 that completed:
 
 ```ts
-import { createProxyServer } from 'chaos-proxy';
-import type { RequestLogEvent } from 'chaos-proxy';
+import { createProxyServer } from '@igkougkousis01/chaos-proxy';
+import type { RequestLogEvent } from '@igkougkousis01/chaos-proxy';
 
 const server = createProxyServer({
   target: 'http://localhost:5000',

@@ -431,9 +431,12 @@ GitHub Release. A manual dispatch is a dry run and never a release: it produces 
 stops, whichever branch or tag it was started from, because creating the release requires the push
 event as well as the tag. That condition is deliberately narrower than the one guarding the version
 check, so a run that creates a release has always verified the tag first — a property a test
-asserts rather than two conditions that happen to match. It is the only workflow with write permission, and it holds no npm token: publishing
-to the registry is a deliberate manual step, because the package name is not owned yet and
-automating a publish nobody can perform would be automation for its own sake.
+asserts rather than two conditions that happen to match. It is the only workflow with write
+permission, and it holds no npm token: publishing to the registry is a deliberate manual step for
+now. The package is `@igkougkousis01/chaos-proxy` — scoped, because the unscoped name on npm is
+someone else's project — and it has never been published, which is precisely why the first publish
+cannot be automated: npm grants a trusted publisher only to a package that already exists.
+`docs/npm-publishing.md` has the sequence.
 
 The version in the manifest is bumped in its own commit immediately before the tag, never as part
 of the work being released. `docs/release-checklist.md` is the sequence.

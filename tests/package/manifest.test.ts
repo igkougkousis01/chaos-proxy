@@ -40,7 +40,10 @@ const manifest = readJson('package.json');
 
 describe('package manifest', () => {
   it('keeps the published identity', () => {
-    expect(manifest.name).toBe('chaos-proxy');
+    // Scoped, and not by preference: the unscoped `chaos-proxy` on the registry
+    // belongs to another maintainer, and their `1.0.0` is already published and
+    // immutable. docs/npm-publishing.md has the detail.
+    expect(manifest.name).toBe('@igkougkousis01/chaos-proxy');
     expect(manifest.license).toBe('MIT');
     expect(manifest.type).toBe('module');
   });
@@ -58,6 +61,20 @@ describe('package manifest', () => {
 
   it('installs one binary, from the build output', () => {
     expect(manifest.bin).toEqual({ 'chaos-proxy': './dist/cli.js' });
+  });
+
+  it('names the command after the tool, not after the scoped package', () => {
+    // The most confusable fact about this package, so it is asserted rather
+    // than left to a comment. `bin` names are not namespaced: the registry
+    // coordinate is `@igkougkousis01/chaos-proxy` and the command a consumer
+    // types is `chaos-proxy`. Renaming the binary to match the package would
+    // invalidate every documented invocation, and would still be a valid
+    // manifest — nothing but this would notice.
+    const binNames = Object.keys(manifest.bin as Record<string, string>);
+
+    expect(binNames).toEqual(['chaos-proxy']);
+    expect(binNames).not.toContain(manifest.name);
+    expect(manifest.name).not.toBe(binNames[0]);
   });
 
   it('exports the public API and nothing else', () => {
@@ -135,12 +152,16 @@ describe('release version', () => {
   it('is stated identically in the lockfile', () => {
     // `npm ci` installs from the lockfile, and a lockfile that disagrees with
     // the manifest is a version the release workflow would verify but never
-    // install.
+    // install. The name is checked alongside it because `npm pkg set name`
+    // does not touch the lockfile: the rename can half-apply, and a lockfile
+    // still naming the unscoped package is exactly what that looks like.
     const lockfile = readJson('package-lock.json');
     const root = (lockfile.packages as Record<string, Record<string, unknown>>)[''];
 
     expect(lockfile.version).toBe(version);
     expect(root?.version).toBe(version);
+    expect(lockfile.name).toBe(manifest.name);
+    expect(root?.name).toBe(manifest.name);
   });
 
   it('has a dated changelog entry, with `Unreleased` still open above it', () => {
@@ -349,10 +370,12 @@ describe('release workflow', () => {
 
 describe('npm publication', () => {
   // The registry name `chaos-proxy` belongs to another maintainer, and their
-  // own `1.0.0` is already published and immutable. Publication is therefore
-  // blocked on a naming decision that only the maintainer can make, and these
-  // assertions keep the repository honest about that until it is made. They
-  // are all offline: nothing here contacts the registry or needs credentials.
+  // own `1.0.0` is already published and immutable, so this package publishes
+  // under the scope instead. The name is settled; what is not yet done is the
+  // publishing, which npm requires be bootstrapped by hand once before a
+  // trusted publisher can exist. These assertions keep the repository honest
+  // about that gap. They are all offline: nothing here contacts the registry
+  // or needs credentials.
 
   function workflowSources(): { name: string; source: string }[] {
     const dir = new URL('.github/workflows/', repoRoot);
@@ -381,10 +404,12 @@ describe('npm publication', () => {
     }
   });
 
-  it('declares public access, which a scoped fallback name would require', () => {
-    // Unscoped, this is npm's default. Scoped — `@igkougkousis01/chaos-proxy`
-    // is the obvious way out of the name conflict — the default is *private*,
-    // and a rename without this would either fail or publish a private package.
+  it('declares public access, which the scoped name requires', () => {
+    // Unscoped, public is npm's default and this would be redundant. Scoped, it
+    // is load-bearing: npm defaults a scoped package to *restricted*, so
+    // dropping this line does not fail the publish — it succeeds, privately,
+    // and the package is silently unavailable to everyone it was published for.
+    expect((manifest.name as string).startsWith('@')).toBe(true);
     expect(manifest.publishConfig).toEqual({ access: 'public' });
   });
 
@@ -412,6 +437,76 @@ describe('npm publication', () => {
   });
 });
 
+describe('scoped tarball handling', () => {
+  // Renaming the package changed the name of the file `npm pack` writes:
+  // `@igkougkousis01/chaos-proxy` packs as
+  // `igkougkousis01-chaos-proxy-1.0.1.tgz`, with the scope flattened rather
+  // than preserved. Anything that built that filename out of the package name
+  // would now build the wrong one, and would do it silently — the release
+  // would simply attach nothing, or the smoke test would install a path that
+  // does not exist. So nothing is allowed to construct it.
+
+  const releaseSource = readText('.github/workflows/release.yml');
+  const smokeSource = readText('scripts/package-smoke.mjs');
+
+  it('names no tarball by hand in the release workflow', () => {
+    // Every `.tgz` the workflow mentions has to be a glob. A literal filename
+    // here is the bug: `chaos-proxy-1.0.1.tgz` is the name this package used to
+    // pack under and no longer does.
+    const mentions = releaseSource.match(/\S*\.tgz/g) ?? [];
+
+    expect(mentions.length, 'the release workflow no longer mentions a tarball').toBeGreaterThan(0);
+
+    for (const mention of mentions) {
+      expect(mention, `${mention} is a hand-written tarball name`).toMatch(/\*\.tgz$/);
+    }
+
+    expect(releaseSource).not.toContain('chaos-proxy-');
+  });
+
+  it('attaches exactly one tarball, and fails rather than attaching none', () => {
+    const release = readWorkflow('release.yml');
+    const jobs = release.jobs as Record<string, Record<string, unknown>>;
+    const steps = jobs.release?.steps as {
+      name: string;
+      run?: string;
+      with?: Record<string, unknown>;
+    }[];
+
+    const upload = steps.find((step) => step.name === 'Upload the packed package');
+    expect(upload?.with?.path).toBe('release-artifact/*.tgz');
+
+    // Without this the upload step is a no-op when the pack step produces
+    // nothing, and the first sign of trouble is an empty release.
+    expect(upload?.with?.['if-no-files-found']).toBe('error');
+
+    // `npm pack` writes into an empty directory created for it, so the glob
+    // resolves to the one file npm just wrote and cannot pick up a stale one.
+    const pack = steps.find((step) => step.name === 'Pack the release artifact');
+    expect(pack?.run ?? '').toContain('mkdir -p release-artifact');
+    expect(pack?.run ?? '').toContain('npm pack --pack-destination release-artifact');
+  });
+
+  it('asks npm for the packed filename rather than reconstructing it', () => {
+    // `npm pack --json` reports the name it wrote. Rebuilding it from the
+    // manifest means encoding npm's scope-flattening rule in a second place,
+    // where it can be wrong without anything saying so.
+    expect(smokeSource).toContain("'pack', '--json'");
+    expect(smokeSource).toContain('packResult.filename');
+    expect(smokeSource).not.toMatch(/\$\{name\}-\$\{version\}\.tgz/);
+  });
+
+  it('keeps the package name and the binary name apart in the smoke test', () => {
+    // The smoke test installs the tarball and then has to find the command.
+    // Looking it up under the package name worked only while the two were the
+    // same string, and would now read `bin['@igkougkousis01/chaos-proxy']`,
+    // which is undefined.
+    expect(smokeSource).toContain("const BIN_NAME = 'chaos-proxy'");
+    expect(smokeSource).toContain('installedManifest.bin[BIN_NAME]');
+    expect(smokeSource).not.toContain('installedManifest.bin[name]');
+  });
+});
+
 describe('repository hygiene', () => {
   it('ignores packed tarballs, so a manual `npm pack` cannot be committed', () => {
     expect(readText('.gitignore')).toContain('*.tgz');
@@ -433,8 +528,19 @@ describe('repository hygiene', () => {
   it('does not advertise an npm install that would not work yet', () => {
     // The package is not published. A copy-pasteable `npm install -g` line
     // would send a stranger to whatever else is on the registry under that
-    // name.
+    // name — and under the unscoped name, something else really is there.
     const readme = readText('README.md');
     expect(readme).not.toMatch(/^\s*npm install (-g |--global )?chaos-proxy\s*$/m);
+  });
+
+  it('still says the package is not on the registry', () => {
+    // The scoped name is decided and written down everywhere, which is exactly
+    // the state in which the README starts reading as though publication had
+    // happened. It has not. This has to be flipped deliberately, after the
+    // first publish, and not drift there on its own.
+    const readme = readText('README.md');
+
+    expect(readme).toMatch(/not (yet )?(on npm|published)/i);
+    expect(readme).toContain('@igkougkousis01/chaos-proxy');
   });
 });

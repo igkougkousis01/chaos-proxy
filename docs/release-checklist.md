@@ -1,7 +1,8 @@
 # Release checklist
 
 For maintainers. How a release is cut, from a merged version bump to a GitHub Release with a
-tarball attached. `1.0.0` is the first.
+tarball attached. `1.0.0` was the first; `1.0.1` is the next, and is also the one that bootstraps
+npm publication — see [the one-time npm bootstrap](#the-one-time-npm-bootstrap-for-101) below.
 
 ## Why the version is not bumped in a hardening PR
 
@@ -19,16 +20,18 @@ reviewable change immediately before the tag.
    Move the `## [Unreleased]` entries in `CHANGELOG.md` under a `## [x.y.z]` heading with the
    release date, leaving `## [Unreleased]` above it, empty. Nothing else belongs in that PR.
 3. **Wait for CI to pass** on `main` after it merges.
-4. **Tag it**: `git tag v1.0.0 && git push origin v1.0.0`. The tag must match the manifest exactly;
+4. **Tag it**: `git tag v1.0.1 && git push origin v1.0.1`. The tag must match the manifest exactly;
    `scripts/verify-release-tag.mjs` fails the release workflow if it does not.
 5. **The release workflow runs** on that tag: it verifies the tag against the manifest, runs the
    full quality gate, runs the package smoke test, packs the tarball, and creates the GitHub
-   Release with `chaos-proxy-1.0.0.tgz` attached.
-6. **Publish to npm — currently blocked.** This is not automated and no npm token exists in this
-   repository. It is also not currently possible: the name `chaos-proxy` on npm belongs to another
-   maintainer and their own `1.0.0` is already published, so the name has to be settled before
-   anything can ship. See [npm publishing](npm-publishing.md) for the conflict, the one manual
-   bootstrap publish npm requires before OIDC can take over, and the trusted-publisher setup.
+   Release with the packed `.tgz` attached. The workflow globs whatever `npm pack` wrote rather
+   than naming it, which matters now that the package is scoped: `@igkougkousis01/chaos-proxy`
+   packs as `igkougkousis01-chaos-proxy-1.0.1.tgz`, with the scope flattened. Attach npm's own
+   artifact under npm's own name; do not rename it.
+6. **Publish to npm.** Not automated, and deliberately so for the first version — npm cannot grant
+   a trusted publisher to a package that does not exist yet. For `1.0.1` that is the one-time
+   bootstrap below. Afterwards it becomes a CI job over OIDC, with no token. See
+   [npm publishing](npm-publishing.md) for the full reasoning.
 
 ## Rehearsing it
 
@@ -57,10 +60,41 @@ matter which branch or tag it is started from — only a pushed `v*` tag creates
 - [ ] The packed tarball installs and runs in a clean project outside the repository — this is
       what `npm run package:smoke` proves
 - [ ] CI green on the commit being tagged
-- [ ] Tag matches the manifest version exactly (`v1.0.0` for `1.0.0`)
+- [ ] Tag matches the manifest version exactly (`v1.0.1` for `1.0.1`)
+- [ ] `package.json` and `package-lock.json` agree on the package _name_ as well as the version —
+      `npm pkg set name` does not touch the lockfile, so a rename can half-apply
 
 ## After the release
 
 - [ ] GitHub Release exists, with the `.tgz` attached
 - [ ] The attached tarball installs in a clean project
 - [ ] A fresh `## [Unreleased]` section opened in `CHANGELOG.md`
+
+## The one-time npm bootstrap, for `1.0.1`
+
+This runs once, ever, and only after the GitHub Release above exists. It is separate from the
+checklist above because none of it is part of cutting a release: it is what makes the package exist
+on the registry so that every later release can publish itself.
+
+The full reasoning — why the name is scoped, why the first publish cannot come from CI, and what
+the trusted publisher needs — is in [npm publishing](npm-publishing.md). The order:
+
+- [ ] `npm logout && npm login`, then `npm whoami` returns the account owning the
+      `@igkougkousis01` scope
+- [ ] Clean checkout of the tag, not of `main`: `git checkout v1.0.1` in a fresh clone or worktree
+- [ ] `npm ci`
+- [ ] `npm publish --dry-run` — confirm `@igkougkousis01/chaos-proxy@1.0.1`, access `public`, and
+      the file list
+- [ ] `npm publish` — 2FA prompts, and stays enabled
+- [ ] `npm view @igkougkousis01/chaos-proxy version` returns `1.0.1`
+- [ ] `npm view @igkougkousis01/chaos-proxy dist-tags` has `latest` on `1.0.1`
+- [ ] A clean project outside the repository installs it and imports `createProxyServer`
+- [ ] `npm install -g @igkougkousis01/chaos-proxy@1.0.1` puts a `chaos-proxy` command on `PATH`,
+      and `chaos-proxy --version` prints `1.0.1`
+- [ ] Configure the npm trusted publisher on the now-existing package
+- [ ] README updated to say the package is on npm — it currently says it is not, and that is the
+      last thing to change, not the first
+- [ ] `.github/workflows/publish.yml` added in a follow-up PR, over OIDC, with no token
+
+After that, publication is part of the release rather than an appendix to it, and this section can
+go.

@@ -24,7 +24,7 @@ import { createServer, request as httpRequest } from 'node:http';
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { createServer as createRawServer } from 'node:net';
 import { tmpdir } from 'node:os';
-import { join, relative } from 'node:path';
+import { basename, join, relative } from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 
@@ -32,6 +32,17 @@ const repoRoot = fileURLToPath(new URL('../', import.meta.url));
 
 /** How long any single wait here may take before it counts as a failure. */
 const WAIT_TIMEOUT_MS = 60_000;
+
+/**
+ * The command the package installs, which is deliberately not the package name.
+ *
+ * The package is scoped — `@igkougkousis01/chaos-proxy` — because the unscoped
+ * registry name belongs to someone else. `bin` names are not namespaced, so the
+ * executable a consumer gets is still `chaos-proxy`. Every lookup below that
+ * concerns the binary uses this rather than the manifest name, and the checks
+ * assert the two differ rather than quietly assuming they match.
+ */
+const BIN_NAME = 'chaos-proxy';
 
 /** Files the package must contain, because a consumer cannot work without them. */
 const REQUIRED_ENTRIES = [
@@ -236,10 +247,27 @@ async function main() {
 
     // The tarball is written into the throwaway workspace rather than the
     // repository, so a failed run cannot leave a `.tgz` behind in the tree.
-    const packed = await runOrThrow('npm', ['pack', '--pack-destination', workspace], {
+    //
+    // The filename comes from `--json` rather than from the last line of
+    // stdout, because for a scoped package it is not derivable from the name
+    // by any rule worth encoding here: npm flattens the scope, so
+    // `@igkougkousis01/chaos-proxy` packs as
+    // `igkougkousis01-chaos-proxy-1.0.1.tgz`. npm already knows what it wrote;
+    // asking it is the only answer that cannot drift.
+    const packed = await runOrThrow('npm', ['pack', '--json', '--pack-destination', workspace], {
       cwd: repoRoot,
     });
-    const tarball = join(workspace, packed.stdout.trim().split('\n').at(-1).trim());
+
+    // `prepack` output goes to stderr under `--json`, but slicing from the
+    // opening bracket costs nothing and survives an npm that decides otherwise.
+    const [packResult] = JSON.parse(packed.stdout.slice(packed.stdout.indexOf('[')));
+    const tarball = join(workspace, basename(packResult.filename));
+
+    check(
+      'npm pack reports the package it was asked for',
+      packResult.name === name && packResult.version === version,
+      `npm pack reported ${packResult.name}@${packResult.version}`,
+    );
     pass(`packed to ${relative(workspace, tarball)}`);
 
     step('Installing the tarball into an empty project');
@@ -286,9 +314,26 @@ async function main() {
     step('Binary entry');
 
     const installedManifest = JSON.parse(await readFile(join(installed, 'package.json'), 'utf8'));
-    const binRelative = installedManifest.bin[name];
+
+    // The distinction this whole section exists to hold: what the registry
+    // calls the package and what the shell calls the command are two different
+    // names, and only the first one is scoped.
     check(
-      `bin declares ${name}`,
+      `the installed package is ${name}`,
+      installedManifest.name === name,
+      `installed manifest says ${installedManifest.name}`,
+    );
+    check(
+      `the installed command is ${BIN_NAME}, not the package name`,
+      Object.keys(installedManifest.bin ?? {}).length === 1 &&
+        BIN_NAME in (installedManifest.bin ?? {}) &&
+        BIN_NAME !== name,
+      `bin is ${JSON.stringify(installedManifest.bin)} for package ${name}`,
+    );
+
+    const binRelative = installedManifest.bin[BIN_NAME];
+    check(
+      `bin declares ${BIN_NAME}`,
       typeof binRelative === 'string',
       `bin is ${JSON.stringify(installedManifest.bin)}`,
     );
@@ -302,10 +347,12 @@ async function main() {
       `first line is ${JSON.stringify(cliSource?.split('\n')[0])}`,
     );
 
+    // Scoped or not, the shim npm writes is named after the `bin` key, so this
+    // is what a consumer actually types.
     const shims = await listFiles(join(consumer, 'node_modules', '.bin')).catch(() => []);
     check(
-      `node_modules/.bin has a ${name} shim`,
-      shims.some((shim) => shim === name || shim.startsWith(`${name}.`)),
+      `node_modules/.bin has a ${BIN_NAME} shim`,
+      shims.some((shim) => shim === BIN_NAME || shim.startsWith(`${BIN_NAME}.`)),
       `found ${shims.join(', ') || 'nothing'}`,
     );
 
