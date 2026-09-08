@@ -1,7 +1,23 @@
 # npm publishing
 
-For maintainers. Which name this package publishes under, why that is not the obvious one, and the
-one manual step npm requires before publication can be automated.
+For maintainers. Which name this package publishes under, why that is not the obvious one, the one
+manual step npm required before publication could be automated, and how every release publishes
+itself now that it is done.
+
+## Where this stands
+
+| Fact                 | Value                                                        |
+| -------------------- | ------------------------------------------------------------ |
+| First npm release    | `@igkougkousis/chaos-proxy@1.0.2`                            |
+| How it was published | Manual bootstrap, by hand, from a clean checkout of `v1.0.2` |
+| Bootstrap status     | **Done.** It runs once, ever, and it has run                 |
+| Every later release  | `.github/workflows/publish.yml`, over OIDC, with no token    |
+| Current `latest`     | `1.0.2`                                                      |
+
+The bootstrap section below is kept as the record of what was done and why, not as a step to
+repeat. What is still outstanding is the npm-side and GitHub-side configuration in
+[After the bootstrap](#after-the-bootstrap-configuring-the-trusted-publisher), without which the
+publish workflow will run and be rejected at the last step.
 
 ## The name
 
@@ -62,8 +78,8 @@ Two things follow, and the second is the one that decided the version number:
 Deprecation upstream does not free the name. It is a warning attached to a version; it releases
 nothing and makes no version number available again.
 
-A scoped package sidesteps all of it: the scope belongs to the account, and nothing is published in
-it yet.
+A scoped package sidesteps all of it: the scope belongs to the account, and `1.0.2` is published in
+it.
 
 ## Why `1.0.2` and not a re-cut `1.0.1`
 
@@ -84,40 +100,51 @@ scope the package is published under, and the docs and packaging checks that fol
 
 ## The bootstrap problem
 
-The first publication cannot be automated. This is a hard npm limitation, not a preference:
+The first publication could not be automated. This is a hard npm limitation, not a preference:
 
 > The package you're configuring must already exist on the npm registry.
 > — [`npm trust` documentation](https://docs.npmjs.com/cli/v11/commands/npm-trust/)
 
 A trusted publisher is configured in a _package's_ settings, and a package that has never been
 published has no settings to configure. Unlike PyPI, npm has no pending-publisher concept. So the
-order is fixed and cannot be rearranged:
+order was fixed and could not be rearranged:
 
 ```
-1. maintainer publishes the first version manually, from a laptop
+1. maintainer publishes the first version manually, from a laptop   (done: 1.0.2)
 2. maintainer configures the trusted publisher on the now-existing package
 3. every later version publishes from CI over OIDC, with no token
 ```
 
-Step 1 is the one manual publish this project should ever need.
+Step 1 was the one manual publish this project should ever need, and it has happened. Everything
+below is either the record of it or the two steps that follow from it.
 
-## Requirements for the bootstrap
+## Tooling versions
 
-|      | Required for                | Notes                                 |
-| ---- | --------------------------- | ------------------------------------- |
-| Node | `>= 22.14.0`                | Release tooling only                  |
-| npm  | `>= 11.5.1` for `npm trust` | The publish itself works on older npm |
+Three different minimums, easily confused, and only the first one is about consumers:
 
-These are release-tooling requirements and say nothing about what consumers need. The package keeps
-`engines.node: ">=22.12"`, which is not changed to suit a publishing step.
+| Applies to                   | Requirement                        | Where it is enforced                               |
+| ---------------------------- | ---------------------------------- | -------------------------------------------------- |
+| Consumers running the CLI    | Node `>= 22.12`                    | `engines.node` in the manifest                     |
+| Publishing over OIDC         | Node `>= 22.14.0`, npm `>= 11.5.1` | The publish workflow's Node 24 job                 |
+| The `npm trust` CLI, locally | npm `>= 11.15.0`                   | Nowhere — it is a maintainer's laptop, run by hand |
 
-The npm CLI on the machine last used for this was `10.9.4`, which has no `npm trust` subcommand. The
-bootstrap publish in step 1 does not need it; step 2 does, so either upgrade the npm CLI for that
-step or configure the trusted publisher on npmjs.com instead, which needs no particular CLI version.
+The publishing requirements say nothing about what consumers need, and `engines.node` is not
+widened to suit a publishing step. The Node 22 line bundles npm 10.x, which is why the publish
+workflow runs on Node 24: it currently bundles npm 11.19, and the workflow checks rather than
+assumes, topping up to `npm@^11.5.1` if a future Node 24 patch ships something older.
 
-## Authentication
+`npm trust` is stricter still, and it is the only piece that needs npm `>= 11.15.0`. The npm CLI on
+the machine last used for this was `10.9.4`, which has no `npm trust` subcommand at all — so either
+upgrade npm locally for that one command, or configure the trusted publisher on npmjs.com instead,
+which needs no particular CLI version and is the route this project recommends.
 
-Before publishing, get to a known-good login rather than assuming the machine already has one:
+## Authentication, for the manual bootstrap
+
+This section applies to the one hand-typed publish below and to nothing else. Automated
+publication authenticates over OIDC and needs no login at all.
+
+Before publishing by hand, get to a known-good login rather than assuming the machine already has
+one:
 
 ```bash
 npm logout
@@ -134,7 +161,10 @@ publish time, and that prompt is the point.
 No token is created, stored, or copied into repository settings for any of this. The entire reason
 for moving to a trusted publisher afterwards is that no long-lived credential has to exist.
 
-## 1. Bootstrap the first version manually
+## 1. Bootstrap the first version manually — done
+
+This ran once, for `1.0.2`, and is kept as the record of what was done. It is not a step to repeat:
+`1.0.3` and everything after it publish from CI.
 
 From a clean checkout of the release tag, never from `main` or a branch head. Anything merged after
 the tag is not part of the release, and the artifact must be built from what was tagged:
@@ -165,90 +195,123 @@ Three things to check in the `--dry-run` output before running the real thing:
   rather than preserving it, which is worth knowing before it surprises a script. Nothing in this
   repository constructs that name — `npm pack --json` is asked for it — and nothing should start.
 
-## 2. Configure the trusted publisher
+## After the bootstrap: configuring the trusted publisher
 
-Either on npmjs.com, under the package's Settings → Trusted Publisher, or with npm `>= 11.5.1`:
+Two manual steps remain, both in a browser, both outstanding. `.github/workflows/publish.yml`
+exists and will run on the next release — it will pass every check and be rejected at
+`npm publish` until these are done, which is the right way round: a rejection is visible, and a
+publish that quietly used a token would not be.
+
+Neither can be done from this repository, and neither should be attempted from CI.
+
+### 2. Create the `npm` GitHub Environment
+
+Repository **Settings → Environments → New environment**, named exactly:
+
+```
+npm
+```
+
+The publish job already declares `environment: npm`. Creating it gives the publish a deployment
+record, somewhere to attach a required reviewer if publication should need a human, and a policy
+boundary a bare workflow does not have. It is created first because the trusted publisher below
+names it, and the two have to agree.
+
+Optional but worth considering: add yourself as a **required reviewer**. Publication then pauses
+for an approval instead of happening the moment a release is published, which costs one click per
+release and makes an accidental release recoverable.
+
+### 3. Configure the npm trusted publisher
+
+On npmjs.com: the package page → **Settings → Trusted Publisher → GitHub Actions**. The four
+fields, and the exact values:
+
+| Field                | Value            |
+| -------------------- | ---------------- |
+| Organization or user | `igkougkousis01` |
+| Repository           | `chaos-proxy`    |
+| Workflow filename    | `publish.yml`    |
+| Environment          | `npm`            |
+
+**Every value in that table is the GitHub identity, `igkougkousis01`.** The trusted publisher
+describes where the code is, not what the package is called; `@igkougkousis` is the npm scope and
+appears in the package name and nowhere in this configuration. The two strings differ by two
+characters and this is the single easiest place in the project to get them the wrong way round.
+
+The workflow filename is part of the trust relationship. Renaming `publish.yml` breaks publication
+until the trusted publisher is updated to match, which is why the file is named in this document
+and asserted in the test suite.
+
+There is a CLI equivalent, if npm `>= 11.15.0` is installed locally:
 
 ```bash
-npm trust github --repo igkougkousis01/chaos-proxy --file publish.yml
+npm trust github @igkougkousis/chaos-proxy \
+  --repo igkougkousis01/chaos-proxy \
+  --file publish.yml \
+  --env npm \
+  --allow-publish
 ```
 
-The fields npm asks for:
+It requires write access to the package and account-level 2FA. The browser route needs no
+particular CLI version and is the recommended one; the command is recorded here so that nobody has
+to reconstruct its flags.
 
-| Field                | Value                                   |
-| -------------------- | --------------------------------------- |
-| Organization or user | `igkougkousis01`                        |
-| Repository           | `chaos-proxy`                           |
-| Workflow filename    | `publish.yml`                           |
-| Environment          | `npm`, if the environment below is used |
+## How automated publication works
 
-The repository is the GitHub one, so every value in that table is `igkougkousis01` — the trusted
-publisher describes where the code is, not what the package is called. The package name is the only
-place `@igkougkousis` appears. The workflow filename is part of the trust relationship, so it has
-to be decided before this step and cannot drift afterwards without updating the publisher.
+`.github/workflows/publish.yml`. What it does, and why each part is the way it is:
 
-## 3. Create the `npm` GitHub Environment
-
-In the repository's Settings → Environments. Worth doing: it gives the publish job a deployment
-record, an optional required reviewer, and a policy boundary that a bare workflow does not have. If
-the trusted publisher names an environment, the workflow must use the same one or OIDC will be
-rejected.
-
-## 4. Add the publish workflow
-
-`.github/workflows/publish.yml` is deliberately absent until the three steps above are done. A
-workflow that publishes cannot succeed before the package exists and the trusted publisher is
-configured, and one that sits in the repository looking like working infrastructure until the first
-time anyone relies on it is worse than none.
-
-The design it should follow:
-
-```yaml
-on:
-  release:
-    types: [published] # follows a successful GitHub Release, never a branch push
-
-permissions:
-  contents: read
-  id-token: write # the OIDC token; nothing else
-
-jobs:
-  publish:
-    runs-on: ubuntu-latest # trusted publishing requires a hosted runner
-    environment: npm
-    steps:
-      # check out the release tag, never the branch head
-      # setup-node, then ensure npm >= 11.5.1
-      # npm ci
-      # npm run release:verify-tag -- "$TAG"
-      # npm run check && npm run package:smoke
-      # npm publish --dry-run
-      # guard: fail if this version is already on the registry
-      # npm publish
-```
+| Step                         | What it does                                                            |
+| ---------------------------- | ----------------------------------------------------------------------- |
+| Trigger                      | `release: published` — never a branch push, never a manual dispatch     |
+| Checkout                     | `ref: github.event.release.tag_name`, the exact released tag            |
+| Node                         | 24, with npm topped up to `^11.5.1` if the bundled one is older         |
+| `release:verify-tag`         | The tag and the manifest must name the same version                     |
+| `release:verify-publishable` | The package name is the expected one, and this version is not published |
+| `npm run check`              | Typecheck, lint, format, test, build                                    |
+| `npm run package:smoke`      | Pack, install into a throwaway project, drive the result                |
+| `npm publish --dry-run`      | What would be sent, before anything is immutable                        |
+| `npm publish`                | `--access public`, over OIDC, no token                                  |
 
 Points that are decisions rather than boilerplate:
 
-- **`release: published`, not `push: tags`.** npm publication should follow a GitHub Release that
-  already succeeded, rather than racing the release workflow on the same tag.
-- **`release.yml` is not touched.** GitHub Release creation and npm publication stay in separate
-  workflows so that a fault in one cannot take out the other. `release.yml` needs `contents: write`
-  and no OIDC; a publish job needs `id-token: write` and no write access. Neither should hold the
-  other's permissions.
-- **Reuse `scripts/verify-release-tag.mjs`.** There should not be a second answer to "which version
-  is this". It compares the tag to the manifest version and is indifferent to the package name, so
-  the rename did not affect it.
-- **An already-published guard.** npm versions are immutable, so a re-run must not attempt a
-  republish. Fail loudly rather than exiting quietly — a publish job that silently does nothing is
-  indistinguishable from one that worked.
-- **No `NPM_TOKEN` or `NODE_AUTH_TOKEN`, ever.** That is the entire point of trusted publishing: no
-  long-lived credential exists to leak. Provenance attestations are generated automatically for a
-  public package published over OIDC from a public repository, so there is nothing to configure and
-  nothing to switch off.
+- **`release: published`, not `push: tags`.** npm publication follows a GitHub Release that already
+  succeeded, rather than racing the release workflow on the same tag.
+- **The exact tag is checked out.** Not `main`, and not `github.sha` — for a release event that is
+  the commit the tag pointed at when the event fired, which is close enough to be misleading and
+  is not what the release is named after. Publishing a branch head would ship code that was never
+  released.
+- **`release.yml` is untouched.** GitHub Release creation and npm publication are separate
+  workflows so a fault in one cannot take out the other, and so neither holds the other's
+  permissions: `release.yml` needs `contents: write` and no OIDC; the publish job needs
+  `id-token: write` and no write access at all.
+- **`scripts/verify-release-tag.mjs` is reused.** There is one answer to "which version is this".
+  It compares the tag to the manifest and is indifferent to the package name.
+- **The already-published guard is its own script.** `scripts/verify-publishable.mjs` asks the
+  registry, and the reason it is a script rather than a line of shell is that `npm view` exits
+  non-zero both for "no such version" and for "could not reach the registry". It reads npm's own
+  `--json` error code: `E404` means the version is free, a success with a version means it is
+  taken and the run stops, and anything else — a 5xx, a timeout, DNS, an npm that crashed — stops
+  the run too. Publishing through an outage is the one failure here that cannot be undone.
+- **Drafts and pre-releases are refused.** By a job-level `if`, so they produce no run at all
+  rather than a red one to explain. This project publishes only to `latest` and has no
+  pre-release channel; a pre-release landing in `latest` would hand every plain `npm install` a
+  version never meant for it.
+- **A duplicate publish fails loudly.** Never a quiet success: a publish job that silently does
+  nothing is indistinguishable from one that worked, and the difference surfaces only when
+  somebody goes looking for a version that was never published.
+- **Concurrency is per release tag, and never cancelled.** Two runs for the same release cannot
+  overlap, and an in-flight publish is not killed by a later one.
+- **No `NPM_TOKEN` or `NODE_AUTH_TOKEN`, ever.** That is the entire point of trusted publishing:
+  no long-lived credential exists to leak. A test asserts that no workflow in the repository
+  mentions either.
+- **No `--provenance`.** npm generates a provenance attestation automatically for a public package
+  published over OIDC from a public repository. Passing the flag is not required and is not a way
+  to get more of it; it is also never disabled.
 
-## After a real publication
+## Verifying a publication
 
-Only once the package actually exists. Confirm the registry agrees with the release:
+After any publish, manual or automated. Done for `1.0.2`, and all of it passed. Confirm the
+registry agrees with the release — substitute the version being checked:
 
 ```bash
 npm view @igkougkousis/chaos-proxy version
@@ -275,10 +338,25 @@ chaos-proxy --help
 Then drive one request through the proxy. `npm run package:smoke` does all of this against a locally
 packed tarball already; this repeats it against what the registry actually served.
 
-Only then update the README. It currently says the package is not on npm, which is true and should
-stay until it is not.
+For an automated publish there is one more thing to look at, which a manual one cannot produce: the
+package page on npmjs.com should show the release as built from this repository's workflow, with no
+token involved. npm generates that attestation automatically for a public package published over
+OIDC from a public repository. What the page calls it is npm's to change, so it is not quoted here
+— the thing to confirm is that it points at `igkougkousis01/chaos-proxy` and at `publish.yml`.
+
+The README says the package is on npm. That was flipped once, deliberately, after `1.0.2` was
+verified — not before.
 
 ## Dist-tag
 
-The first public release takes `latest`, which is npm's default. No `next` or `beta` tags — this
-project has no pre-release channel and inventing one at publication time would be surprising.
+Every release takes `latest`, which is npm's default, and `1.0.2` holds it now. No `next`, `beta`,
+`alpha` or `canary` — this project has no pre-release channel, the publish workflow refuses a
+GitHub pre-release outright, and inventing a channel at publication time would be surprising.
+
+## The next release
+
+The full sequence is in [the release checklist](release-checklist.md). In short, once the two
+configuration steps above are done, `1.0.3` needs no publishing step at all: bump, tag, push, and
+the GitHub Release triggers the publish workflow. The only new thing to watch the first time is
+whether the trusted publisher was configured correctly, and the failure mode if it was not is a
+rejected `npm publish` at the end of a run that otherwise passed.

@@ -1,6 +1,7 @@
 # Chaos Proxy
 
 [![CI](https://github.com/igkougkousis01/chaos-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/igkougkousis01/chaos-proxy/actions/workflows/ci.yml)
+[![npm](https://img.shields.io/npm/v/@igkougkousis/chaos-proxy.svg)](https://www.npmjs.com/package/@igkougkousis/chaos-proxy)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Node.js >= 22.12](https://img.shields.io/badge/node-%3E%3D22.12-brightgreen.svg)](#requirements)
 
@@ -19,18 +20,10 @@ that loading states, retries, error handling, and timeout behaviour can be exerc
 
 ## Quickstart
 
-The package is not on npm yet, so the CLI runs from a clone
-([full install instructions](#install)):
+Run it without installing anything ([full install instructions](#install)):
 
 ```bash
-git clone https://github.com/igkougkousis01/chaos-proxy.git
-cd chaos-proxy && npm install && npm run build
-```
-
-Point it at the API you want to degrade:
-
-```bash
-node dist/cli.js --target http://localhost:3000 --preset flaky-api
+npx @igkougkousis/chaos-proxy --target http://localhost:3000 --preset flaky-api
 ```
 
 ```text
@@ -53,7 +46,8 @@ Three things worth knowing before anything else:
 - `--print-config` shows [exactly what a run would do](#inspecting-the-configuration) without
   starting anything, and `--seed` makes a run [repeatable](#reproducible-runs).
 
-After `npm link` (below), every command here is `chaos-proxy` rather than `node dist/cli.js`.
+After a global install (below), every command here is `chaos-proxy` rather than
+`npx @igkougkousis/chaos-proxy`. The package is scoped; the command is not.
 
 ## Requirements
 
@@ -66,9 +60,54 @@ has checked.
 
 ## Install
 
+### From npm
+
+The package is published as `@igkougkousis/chaos-proxy`:
+
+```bash
+npm install -g @igkougkousis/chaos-proxy
+```
+
+That puts a `chaos-proxy` command on your `PATH` — the package is scoped, the command is not,
+because npm does not namespace executables:
+
+```bash
+chaos-proxy --target http://localhost:3000
+```
+
+Or run it without installing anything:
+
+```bash
+npx @igkougkousis/chaos-proxy --target http://localhost:3000
+```
+
+To use the proxy from your own code rather than from a shell, install it as a dependency:
+
+```bash
+npm install @igkougkousis/chaos-proxy
+```
+
+```ts
+import { createProxyServer } from '@igkougkousis/chaos-proxy';
+```
+
+See [Proxy core](#proxy-core) for what that gives you.
+
+**Install the scoped name, not the bare one.** `chaos-proxy` on the registry is a different
+project by another maintainer, so `npm install chaos-proxy` will not give you this tool. The scope
+is the maintainer's npm account name, which is not the same string as their GitHub one: the
+repository lives at `igkougkousis01/chaos-proxy` and the package is `@igkougkousis/chaos-proxy`.
+
+| Thing            | Name                                                                          |
+| ---------------- | ----------------------------------------------------------------------------- |
+| npm package      | `@igkougkousis/chaos-proxy`                                                   |
+| CLI executable   | `chaos-proxy`                                                                 |
+| Import specifier | `@igkougkousis/chaos-proxy`                                                   |
+| GitHub repo      | [`igkougkousis01/chaos-proxy`](https://github.com/igkougkousis01/chaos-proxy) |
+
 ### From source
 
-The package is not published to npm yet, so install it from a clone:
+For working on Chaos Proxy itself, or to run an unreleased commit:
 
 ```bash
 git clone https://github.com/igkougkousis01/chaos-proxy.git
@@ -78,49 +117,12 @@ npm run build
 npm link
 ```
 
-`npm link` puts the `chaos-proxy` command on your `PATH`. Without it, the built CLI can always be
-run directly:
+`npm link` puts the same `chaos-proxy` command on your `PATH`, pointing at the clone. Without it,
+the built CLI can always be run directly:
 
 ```bash
 node dist/cli.js --target http://localhost:3000
 ```
-
-### From npm
-
-**Not available yet.** Nothing below works today; it is here so that the name is unambiguous when
-it does.
-
-The package will be published as `@igkougkousis/chaos-proxy`. It is scoped because the unscoped
-name on the registry is a different project by another maintainer, so installing `chaos-proxy`
-from npm will not give you this tool — now or later. The scope is the maintainer's npm account
-name, which is not the same string as their GitHub one: the repository lives at
-`igkougkousis01/chaos-proxy` and the package is `@igkougkousis/chaos-proxy`.
-
-Once it is published, the install will be:
-
-```bash
-npm install -g @igkougkousis/chaos-proxy
-```
-
-```bash
-npx @igkougkousis/chaos-proxy --target http://localhost:3000
-```
-
-and the command stays `chaos-proxy`, because npm does not namespace executables:
-
-```bash
-chaos-proxy --target http://localhost:3000
-```
-
-| Thing          | Name                                                                          |
-| -------------- | ----------------------------------------------------------------------------- |
-| npm package    | `@igkougkousis/chaos-proxy`                                                   |
-| CLI executable | `chaos-proxy`                                                                 |
-| GitHub repo    | [`igkougkousis01/chaos-proxy`](https://github.com/igkougkousis01/chaos-proxy) |
-
-Until publication, the clone above is the only way to get it. See
-[docs/release-checklist.md](docs/release-checklist.md) for where publishing sits in the release
-process, and [docs/npm-publishing.md](docs/npm-publishing.md) for why it has not happened yet.
 
 ## Usage
 

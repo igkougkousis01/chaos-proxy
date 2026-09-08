@@ -432,13 +432,19 @@ stops, whichever branch or tag it was started from, because creating the release
 event as well as the tag. That condition is deliberately narrower than the one guarding the version
 check, so a run that creates a release has always verified the tag first — a property a test
 asserts rather than two conditions that happen to match. It is the only workflow with write
-permission, and it holds no npm token: publishing to the registry is a deliberate manual step for
-now. The package is `@igkougkousis/chaos-proxy` — scoped, because the unscoped name on npm is
-someone else's project, and scoped under the maintainer's _npm_ username rather than their GitHub
-one, which is the difference `1.0.2` exists to correct — and it has never been published, which is
-precisely why the first publish cannot be automated: npm grants a trusted publisher only to a
-package that already exists.
-`docs/npm-publishing.md` has the sequence.
+permission.
+
+Publication to npm is a second workflow, `.github/workflows/publish.yml`, and the separation is
+deliberate: creating a GitHub Release and putting a version on the registry are different jobs with
+different blast radii, and neither should hold the other's permissions. It fires on
+`release: published`, checks out the exact released tag rather than a branch head, re-verifies the
+tag against the manifest, refuses a version the registry already has, re-runs the whole gate, and
+publishes over OIDC with `id-token: write` and no npm token anywhere in the repository. The package
+is `@igkougkousis/chaos-proxy` — scoped, because the unscoped name on npm is someone else's
+project, and scoped under the maintainer's _npm_ username rather than their GitHub one, which is
+the difference `1.0.2` exists to correct. `1.0.2` was published by hand, and had to be: npm grants
+a trusted publisher only to a package that already exists, so the first publish could not come from
+CI. Every version after it publishes itself. `docs/npm-publishing.md` has the sequence.
 
 The version in the manifest is bumped in its own commit immediately before the tag, never as part
 of the work being released. `docs/release-checklist.md` is the sequence.

@@ -1,0 +1,185 @@
+name: Publish to npm
+
+# The only workflow in this repository that publishes to the registry, and the
+# only one that holds an OIDC token.
+#
+# It runs after a GitHub Release has been published — not alongside one. The
+# release workflow's job is to decide that a version is real and to record it;
+# this one's is to put that already-decided version on the registry. Keeping
+# them apart means a fault in either cannot take out the other, and that
+# neither holds the other's permissions: `release.yml` needs `contents: write`
+# and no OIDC, this needs `id-token: write` and no write access at all.
+#
+# There is no token. npm trusted publishing exchanges the workflow's OIDC token
+# for short-lived publish credentials, so no long-lived npm secret exists in
+# this repository to be leaked, rotated, or forgotten. The trust relationship
+# is configured on the npm package itself and names this file by name — see
+# docs/npm-publishing.md before renaming it.
+on:
+  release:
+    types: [published]
+
+# `contents: read` to check out the tag; `id-token: write` for the OIDC token
+# trusted publishing is built on. Nothing else, at either level: this workflow
+# has no reason to write to the repository, and npm trusted publishing is not
+# GitHub Packages and needs no `packages` scope.
+permissions:
+  contents: read
+
+# A publish is never cancelled, and two runs for the same release never overlap.
+# npm would reject the second publish anyway, but a race that resolves into one
+# clear refusal is better than one that resolves into whichever job happened to
+# get there first.
+concurrency:
+  group: npm-publish-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish ${{ github.event.release.tag_name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    # Trusted publishing requires a GitHub-hosted runner; a self-hosted one
+    # cannot produce an OIDC token npm will accept.
+    #
+    # The environment is named in the trusted publisher configuration on npm's
+    # side, so it is part of the trust relationship rather than decoration: a
+    # publish from a job without it is rejected. It also gives the publish a
+    # deployment record and somewhere to attach a required reviewer, which a
+    # bare workflow has no place for.
+    environment: npm
+
+    permissions:
+      contents: read
+      id-token: write
+
+    # Drafts have no published artifact to correspond to, and this project has
+    # no pre-release channel: `latest` is the only dist-tag it uses, and
+    # publishing a pre-release into it would hand every plain `npm install` a
+    # version that was never meant for it. Both are refused by not running at
+    # all, so a draft or a pre-release produces no red run to explain away.
+    if: github.event.release.draft == false && github.event.release.prerelease == false
+
+    steps:
+      # The exact commit the release names, not the branch head. `main` will
+      # have moved on by the time anyone reads this, and publishing whatever is
+      # on it would ship code that was never released. `github.sha` is no
+      # better: for a `release` event it is the commit the tag pointed at when
+      # the event fired, which is close enough to be misleading and not the
+      # thing the release is named after.
+      #
+      # `persist-credentials: false` because nothing after this step talks to
+      # git, and a checkout token left in the local config is a credential
+      # sitting within reach of every `npm ci` lifecycle script that follows.
+      - name: Check out the released tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          persist-credentials: false
+
+      # Node 24 rather than the 22 the rest of CI uses, and only here: trusted
+      # publishing needs Node >= 22.14 and npm >= 11.5.1, and the npm bundled
+      # with the Node 22 line is 10.x. This is a statement about the publishing
+      # tooling and not about the package, whose `engines` stays at >=22.12 —
+      # what it takes to publish is not what it takes to run.
+      #
+      # No dependency cache. A release build should install what the lockfile
+      # says from the registry, not what a cache restored, and npm's own
+      # guidance for trusted publishing is to leave caching off here.
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          registry-url: https://registry.npmjs.org
+
+      # Node 24 currently bundles npm 11.19, which is already enough, but the
+      # bundled version moves with the Node patch release and the first Node 24
+      # shipped npm 11.3. So it is checked rather than assumed, and topped up
+      # only when it falls short.
+      #
+      # `^11.5.1` rather than `latest`: the floor is the documented requirement
+      # for trusted publishing, and the caret keeps a future npm major — npm 12
+      # is already out — from arriving unannounced in the one job that
+      # publishes. `sort -V` is GNU coreutils, which `ubuntu-latest` has.
+      - name: Ensure npm is new enough for trusted publishing
+        env:
+          REQUIRED_NPM: '11.5.1'
+        run: |
+          set -euo pipefail
+          current="$(npm --version)"
+          oldest="$(printf '%s\n%s\n' "$REQUIRED_NPM" "$current" | sort -V | head -n 1)"
+          if [ "$oldest" != "$REQUIRED_NPM" ]; then
+            echo "npm $current is older than $REQUIRED_NPM; installing npm@^$REQUIRED_NPM"
+            npm install -g "npm@^${REQUIRED_NPM}"
+          fi
+          echo "npm $(npm --version), node $(node --version)"
+
+      - name: Install dependencies
+        run: npm ci
+
+      # The same verifier the release workflow runs, against the same manifest,
+      # so there is one answer to "which version is this" rather than two that
+      # have to be kept in step. The tag arrives through the environment rather
+      # than being interpolated into the script: a tag is a string someone
+      # chose, and `${{ }}` inside a `run` block pastes it into the shell
+      # before the shell ever sees a quote.
+      - name: Verify the release tag matches the package version
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: npm run release:verify-tag -- "$RELEASE_TAG"
+
+      # Deliberately before the quality gate rather than after it. A re-run of
+      # an already-published release is the common way to arrive here by
+      # mistake, and it should be refused in seconds rather than after a full
+      # build. It also asserts the package name: `npm publish` takes the name
+      # from the manifest, so this is the one place the intended coordinate is
+      # written down and can disagree.
+      - name: Verify the package identity, and that this version is unpublished
+        run: npm run release:verify-publishable -- --expect-name @igkougkousis/chaos-proxy
+
+      # CI has already run these on the commit. They run again because this is
+      # the last point at which anything can be stopped, and a gate that is
+      # skipped because it passed somewhere else is a gate that stops applying
+      # the first time "somewhere else" is wrong.
+      - name: Run the quality gate
+        run: npm run check
+
+      - name: Verify the packed package
+        run: npm run package:smoke
+
+      # What the real publish would send, with the same flags, so a packaging
+      # surprise surfaces before anything is immutable. It proves the tarball
+      # and nothing about the registry — the version's availability is the
+      # guard above, and these two are not substitutes for each other.
+      - name: Inspect the publish without performing it
+        run: npm publish --dry-run --access public
+
+      # No token, and none configured: trusted publishing exchanges this job's
+      # OIDC token for a short-lived credential. `--access public` is explicit
+      # even though `publishConfig` sets it, because a scoped package that
+      # defaults to `restricted` publishes successfully and privately, which is
+      # the one failure here that does not look like one.
+      #
+      # No `--provenance`. npm generates a provenance attestation automatically
+      # for a public package published over OIDC from a public repository, and
+      # passing the flag is neither required nor a way to get more of it.
+      - name: Publish to npm
+        run: npm publish --access public
+
+      - name: Summarise what was published
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          # `--input-type=commonjs` is explicit because the manifest says
+          # `"type": "module"`, and relying on `--print` happening to default
+          # the other way is a detail that could change under us.
+          published="$(node --input-type=commonjs -p 'const p=require("./package.json"); `${p.name}@${p.version}`')"
+          {
+            echo "### Published to npm"
+            echo ""
+            echo "- \`${published}\`, from tag \`${RELEASE_TAG}\`"
+            echo "- Dist-tag: \`latest\`"
+            echo "- Authenticated by OIDC trusted publishing; no npm token was used."
+          } >> "$GITHUB_STEP_SUMMARY"

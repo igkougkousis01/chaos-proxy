@@ -13,7 +13,8 @@ import { describe, expect, it } from 'vitest';
  * installs the tarball and drives it. This file covers what that script cannot:
  * the promises the manifest and the workflows make before anything is packed —
  * a narrow public API, an accurate `files` list, a CI job that actually runs the
- * smoke test, and a release workflow that does not publish.
+ * smoke test, a release workflow that does not publish, and a publish workflow
+ * that publishes only what a GitHub Release actually released.
  *
  * It is deliberately not a snapshot of either file. Only the facts worth
  * failing a build over are asserted, so ordinary edits to a workflow or a
@@ -35,6 +36,17 @@ function readText(path: string): string {
 function readWorkflow(name: string): Record<string, unknown> {
   return parseYaml(readText(`.github/workflows/${name}`)) as Record<string, unknown>;
 }
+
+/**
+ * The one workflow allowed to publish, named once.
+ *
+ * It is not an arbitrary filename. The npm trusted publisher grants publish
+ * rights to this repository *and this file*, so renaming it silently revokes
+ * publication until npm is reconfigured to match. Every assertion about
+ * publishing goes through this constant so that a rename fails here — loudly,
+ * in a test — rather than at the end of the next release.
+ */
+const PUBLISH_WORKFLOW = 'publish.yml';
 
 const manifest = readJson('package.json');
 
@@ -129,6 +141,7 @@ describe('package manifest', () => {
       'check',
       'package:smoke',
       'release:verify-tag',
+      'release:verify-publishable',
     ]) {
       expect(scripts[name], `missing script: ${name}`).toBeTypeOf('string');
     }
@@ -393,14 +406,357 @@ describe('release workflow', () => {
   });
 });
 
+describe('publish workflow', () => {
+  // The only workflow that can publish, and the one place a mistake reaches
+  // the registry rather than a build log. npm versions are immutable, so
+  // almost everything asserted here is a property with no undo behind it.
+  //
+  // Parsed rather than matched against text wherever the fact is structural —
+  // a trigger, a permission, a job condition — so that reformatting the file
+  // does not fail the build and so that a fact cannot be satisfied by the word
+  // appearing in a comment. The two text assertions that remain are about the
+  // exact shell command, which is what actually runs.
+
+  const publish = readWorkflow(PUBLISH_WORKFLOW);
+  const source = readText(`.github/workflows/${PUBLISH_WORKFLOW}`);
+
+  /** The single job, whatever it is keyed as. */
+  function publishJob(): Record<string, unknown> {
+    const jobs = publish.jobs as Record<string, Record<string, unknown>>;
+    const names = Object.keys(jobs);
+
+    // One job, deliberately: a second one would be a second place permissions
+    // and conditions are stated, and only one of them would be reviewed.
+    expect(names, 'the publish workflow should have exactly one job').toHaveLength(1);
+
+    return jobs[names[0] as string] as Record<string, unknown>;
+  }
+
+  function steps(): {
+    name?: string;
+    uses?: string;
+    run?: string;
+    with?: Record<string, unknown>;
+  }[] {
+    return publishJob().steps as {
+      name?: string;
+      uses?: string;
+      run?: string;
+      with?: Record<string, unknown>;
+    }[];
+  }
+
+  /** Every `run:` script, in order, as one string per step. */
+  function runs(): string[] {
+    return steps().map((step) => step.run ?? '');
+  }
+
+  /** Where in the step order something first happens, or -1. */
+  function indexOfRun(needle: string): number {
+    return runs().findIndex((run) => run.includes(needle));
+  }
+
+  it('exists', () => {
+    expect(() => readText(`.github/workflows/${PUBLISH_WORKFLOW}`)).not.toThrow();
+  });
+
+  it('runs only when a GitHub Release is published', () => {
+    // `on` is parsed as the boolean `true` by YAML 1.1 rules in some parsers,
+    // hence the lookup, which mirrors the release workflow's.
+    const triggers = (publish.on ?? publish[true as unknown as keyof typeof publish]) as Record<
+      string,
+      unknown
+    >;
+
+    expect(Object.keys(triggers)).toEqual(['release']);
+    expect(triggers.release).toEqual({ types: ['published'] });
+  });
+
+  it('cannot be triggered by a push, a schedule, or a person', () => {
+    // The property behind the assertion above, stated so that *adding* a
+    // trigger fails rather than only changing one. A `workflow_dispatch` is
+    // the tempting one — it is how someone would try to retry a failed publish
+    // — and it is exactly the route by which a branch head gets published.
+    const triggers = (publish.on ?? publish[true as unknown as keyof typeof publish]) as Record<
+      string,
+      unknown
+    >;
+
+    for (const forbidden of ['push', 'pull_request', 'workflow_dispatch', 'schedule']) {
+      expect(triggers, `publish.yml can be triggered by ${forbidden}`).not.toHaveProperty(
+        forbidden,
+      );
+    }
+  });
+
+  it('checks out the exact tag the release names', () => {
+    const checkout = steps().find((step) => (step.uses ?? '').startsWith('actions/checkout'));
+
+    expect(checkout, 'the publish workflow never checks anything out').toBeDefined();
+    expect(checkout?.with?.ref).toBe('${{ github.event.release.tag_name }}');
+  });
+
+  it('never publishes from a branch head', () => {
+    // The failure this exists to prevent, stated as what the checkout must not
+    // be rather than as what it is. `main` moves on after a release, and
+    // `github.sha` for a release event is the commit the tag pointed at when
+    // the event fired — close enough to look right and not the thing the
+    // release is named after.
+    const checkout = steps().find((step) => (step.uses ?? '').startsWith('actions/checkout'));
+    const ref = String(checkout?.with?.ref ?? '');
+
+    expect(ref).toContain('github.event.release.tag_name');
+    expect(ref).not.toContain('github.sha');
+    expect(ref).not.toContain('github.ref');
+    expect(ref).not.toMatch(/\bmain\b/);
+    expect(ref).not.toContain('default_branch');
+  });
+
+  it('asks for the OIDC token, and nothing else beyond reading the repository', () => {
+    expect(publish.permissions).toEqual({ contents: 'read' });
+    expect(publishJob().permissions).toEqual({ contents: 'read', 'id-token': 'write' });
+  });
+
+  it('holds no permission it does not need', () => {
+    // Stated as a denylist as well, because `id-token: write` being present is
+    // not the same claim as nothing else being. Trusted publishing is not
+    // GitHub Packages: `packages: write` would grant a registry this workflow
+    // does not publish to, and `contents: write` would let a publish job
+    // rewrite the tag it is publishing.
+    const granted = publishJob().permissions as Record<string, string>;
+
+    for (const forbidden of [
+      'packages',
+      'actions',
+      'issues',
+      'pull-requests',
+      'deployments',
+      'attestations',
+      'checks',
+      'statuses',
+    ]) {
+      expect(granted, `publish.yml grants ${forbidden}`).not.toHaveProperty(forbidden);
+    }
+
+    expect(granted.contents).toBe('read');
+  });
+
+  it('runs in the `npm` GitHub Environment', () => {
+    // Part of the trust relationship rather than decoration: the trusted
+    // publisher on npm's side names this environment, and a publish from a job
+    // without it is rejected. It is also where a required reviewer can be
+    // attached.
+    expect(publishJob().environment).toBe('npm');
+  });
+
+  it('runs on a GitHub-hosted runner, which trusted publishing requires', () => {
+    // A self-hosted runner cannot produce an OIDC token npm will accept.
+    expect(publishJob()['runs-on']).toBe('ubuntu-latest');
+  });
+
+  it('refuses drafts and pre-releases', () => {
+    // Not a red run to explain away — the job does not start. A draft has no
+    // published release to correspond to, and this project publishes only to
+    // `latest`, so a pre-release reaching it would hand every plain
+    // `npm install` a version never meant for it.
+    const condition = String(publishJob().if ?? '');
+
+    expect(condition).toContain('github.event.release.draft == false');
+    expect(condition).toContain('github.event.release.prerelease == false');
+  });
+
+  it('reuses the tag verifier rather than checking the version again itself', () => {
+    // One answer to "which version is this". A second implementation is a
+    // second thing to keep in step with the manifest.
+    expect(indexOfRun('release:verify-tag')).toBeGreaterThanOrEqual(0);
+  });
+
+  it('guards against republishing a version the registry already has', () => {
+    expect(indexOfRun('release:verify-publishable')).toBeGreaterThanOrEqual(0);
+  });
+
+  it('asserts the package identity it is about to publish', () => {
+    // `npm publish` takes the name from the manifest and never asks, so a
+    // mistyped scope publishes successfully under a name nobody installs. This
+    // is the one place the intended coordinate is written down, so a rename
+    // has to be deliberate in two files rather than one.
+    const guard = runs().find((run) => run.includes('release:verify-publishable')) ?? '';
+
+    expect(guard).toContain('--expect-name');
+    expect(guard).toContain(manifest.name as string);
+  });
+
+  it('runs the same gates a contributor runs', () => {
+    // CI ran these already on this commit. They run again because this is the
+    // last point at which anything can be stopped, and a gate skipped because
+    // it passed somewhere else stops applying the first time "somewhere else"
+    // is wrong.
+    expect(indexOfRun('npm ci')).toBeGreaterThanOrEqual(0);
+    expect(indexOfRun('npm run check')).toBeGreaterThanOrEqual(0);
+    expect(indexOfRun('npm run package:smoke')).toBeGreaterThanOrEqual(0);
+  });
+
+  it('does every check before it publishes anything', () => {
+    // The ordering property, rather than six assertions that each check a step
+    // exists somewhere. Publishing is the last thing that happens, and each of
+    // these is a reason not to reach it.
+    const publishAt = runs().findIndex((run) => /npm publish(?! --dry-run)/.test(run));
+
+    expect(publishAt, 'the publish workflow never publishes').toBeGreaterThanOrEqual(0);
+
+    for (const gate of [
+      'npm ci',
+      'release:verify-tag',
+      'release:verify-publishable',
+      'npm run check',
+      'npm run package:smoke',
+      'npm publish --dry-run',
+    ]) {
+      const at = indexOfRun(gate);
+
+      expect(at, `${gate} does not run`).toBeGreaterThanOrEqual(0);
+      expect(at, `${gate} runs after the publish`).toBeLessThan(publishAt);
+    }
+  });
+
+  it('inspects the publish before performing it', () => {
+    expect(source).toMatch(/npm publish --dry-run --access public/);
+  });
+
+  it('publishes with the exact command, and adds nothing to it', () => {
+    // `--provenance` is deliberately absent: npm attaches a provenance
+    // attestation automatically for a public package published over OIDC from
+    // a public repository, and the flag is neither required nor a way to get
+    // more of it. It is also never disabled.
+    //
+    // Asserted against the scripts rather than the file, so that a comment may
+    // explain the absence without being mistaken for the flag itself.
+    expect(source).toMatch(/^\s*run: npm publish --access public$/m);
+
+    for (const run of runs()) {
+      expect(run, 'a step passes a provenance flag').not.toMatch(/--(no-)?provenance/);
+    }
+  });
+
+  it('publishes to `latest`, with no dist-tag of its own', () => {
+    // This project has no pre-release channel. Inventing one at publication
+    // time would be surprising, and `--tag` is how it would happen.
+    expect(source).not.toMatch(/--tag\s/);
+  });
+
+  it('never tries to work around an immutable version', () => {
+    // The three things someone reaches for when a publish is refused, none of
+    // which npm allows and all of which would make the guard pointless.
+    expect(source).not.toContain('--force');
+    expect(source).not.toMatch(/npm\s+unpublish/);
+    expect(source).not.toMatch(/npm\s+dist-tag/);
+  });
+
+  it('cannot race another run for the same release', () => {
+    const concurrency = publish.concurrency as { group: string; 'cancel-in-progress': boolean };
+
+    expect(concurrency.group).toContain('github.event.release.tag_name');
+    expect(concurrency['cancel-in-progress']).toBe(false);
+  });
+
+  it('is bounded in time', () => {
+    const timeout = publishJob()['timeout-minutes'];
+
+    expect(typeof timeout).toBe('number');
+    expect(timeout as number).toBeGreaterThan(0);
+  });
+
+  it('publishes on a Node and npm new enough for trusted publishing', () => {
+    // Node >= 22.14 and npm >= 11.5.1. The Node 22 line bundles npm 10.x, so
+    // the publish job is the one place that does not use the version the rest
+    // of CI does — which says nothing about what consumers need.
+    const setup = steps().find((step) => (step.uses ?? '').startsWith('actions/setup-node'));
+
+    expect(setup?.with?.['node-version']).toBe('24');
+    expect(source).toContain('11.5.1');
+  });
+
+  it('does not widen the runtime the package claims', () => {
+    // The publish job's Node version is about publishing. `engines` is a
+    // promise to consumers, and a publishing requirement is not a reason to
+    // change it.
+    expect((manifest.engines as { node: string }).node).toBe('>=22.12');
+  });
+
+  it('caches no dependencies for a release build', () => {
+    // npm's own guidance for trusted publishing. A release should install what
+    // the lockfile says from the registry, not what a cache restored.
+    const setup = steps().find((step) => (step.uses ?? '').startsWith('actions/setup-node'));
+
+    expect(setup?.with?.cache ?? null).toBeNull();
+  });
+
+  it('leaves no git credential lying around for a lifecycle script', () => {
+    // Nothing after the checkout talks to git, and `npm ci` runs dependency
+    // lifecycle scripts in the same working directory.
+    const checkout = steps().find((step) => (step.uses ?? '').startsWith('actions/checkout'));
+
+    expect(checkout?.with?.['persist-credentials']).toBe(false);
+  });
+
+  it('passes the release tag through the environment, never into a shell', () => {
+    // A tag is a string somebody chose, and `${{ }}` inside a `run:` block is
+    // pasted in before the shell sees a quote. Every step that uses the tag in
+    // a script takes it from `env:` instead.
+    for (const step of steps()) {
+      if (step.run === undefined) {
+        continue;
+      }
+
+      expect(
+        step.run,
+        `${step.name ?? 'a step'} interpolates an expression into its shell`,
+      ).not.toContain('${{');
+    }
+  });
+
+  it('quotes every shell variable it expands', () => {
+    // Unquoted expansion is how a tag containing a space becomes two
+    // arguments. `set -euo pipefail` on every multi-line script is the other
+    // half: a failing command in the middle of one should stop it.
+    const shellSteps = runs().filter((run) => run.includes('$'));
+
+    for (const run of shellSteps) {
+      const bare = run.match(/\$[A-Za-z_][A-Za-z0-9_]*/g) ?? [];
+
+      for (const variable of bare) {
+        // `"$VAR"` and `"${VAR}"` are both fine; a bare `$VAR` is not.
+        expect(run, `${variable} is expanded unquoted`).toMatch(
+          new RegExp(`"[^"\n]*\\${variable}`),
+        );
+      }
+    }
+
+    for (const run of runs()) {
+      if (run.includes('\n') && run.trim() !== '') {
+        expect(run, 'a multi-line script does not fail fast').toContain('set -euo pipefail');
+      }
+    }
+  });
+
+  it('creates nothing: no tag, no release, no commit, no version bump', () => {
+    // Its whole job is to publish a version that already exists. Anything that
+    // writes back to the repository is either a recursion or a second source
+    // of truth for the version.
+    expect(source).not.toMatch(/gh release create/);
+    expect(source).not.toMatch(/git (tag|push|commit)/);
+    expect(source).not.toMatch(/npm version/);
+  });
+});
+
 describe('npm publication', () => {
   // The registry name `chaos-proxy` belongs to another maintainer, and their
   // own `1.0.0` is already published and immutable, so this package publishes
-  // under the scope instead. The name is settled; what is not yet done is the
-  // publishing, which npm requires be bootstrapped by hand once before a
-  // trusted publisher can exist. These assertions keep the repository honest
-  // about that gap. They are all offline: nothing here contacts the registry
-  // or needs credentials.
+  // under the scope instead. `@igkougkousis/chaos-proxy@1.0.2` was published by
+  // hand, because npm grants a trusted publisher only to a package that
+  // already exists; everything after it publishes from CI over OIDC. These
+  // assertions are all offline: nothing here contacts the registry or needs
+  // credentials.
 
   function workflowSources(): { name: string; source: string }[] {
     const dir = new URL('.github/workflows/', repoRoot);
@@ -410,18 +766,46 @@ describe('npm publication', () => {
       .map((name) => ({ name, source: readText(`.github/workflows/${name}`) }));
   }
 
-  it('has no workflow that publishes to the registry', () => {
-    // Deliberately every workflow, not just `release.yml`: the failure this
-    // guards against is a *new* workflow being added that publishes, which an
-    // assertion naming one file by hand would not see.
+  it('publishes from exactly one workflow, and it is the one named in the trust settings', () => {
+    // This assertion used to be "no workflow publishes", which was right while
+    // publishing was a manual step. It is now the narrower and more useful
+    // claim: `publish.yml` is authorised and every other workflow — including
+    // ones nobody has written yet — is not. The npm trusted publisher grants
+    // publish rights to this filename specifically, so the set of files
+    // allowed to contain the command is exactly the set npm will accept it
+    // from.
+    const publishers = workflowSources().filter(({ source }) => /npm\s+publish/.test(source));
+
+    expect(publishers.map(({ name }) => name)).toEqual([PUBLISH_WORKFLOW]);
+  });
+
+  it('lets no other workflow publish, whatever it is called', () => {
+    // Stated per-file as well as as a set, so a failure names the offender
+    // rather than printing two arrays for a reader to diff.
     for (const { name, source } of workflowSources()) {
-      expect(source, `${name} runs npm publish`).not.toMatch(/npm\s+publish(?!.*--dry-run)/);
+      if (name === PUBLISH_WORKFLOW) {
+        continue;
+      }
+
+      expect(source, `${name} runs npm publish`).not.toMatch(/npm\s+publish/);
     }
+  });
+
+  it('publishes with the exact command the scoped package needs', () => {
+    // `--access public` on the command line even though `publishConfig` sets
+    // it: npm defaults a *scoped* package to restricted, and that failure does
+    // not look like one — the publish succeeds, privately.
+    const source = readText(`.github/workflows/${PUBLISH_WORKFLOW}`);
+
+    expect(source).toMatch(/npm publish --access public/);
   });
 
   it('has no workflow that references a long-lived npm token', () => {
     // Trusted publishing exists so that no such credential has to exist. A
     // token appearing in a workflow means that decision was quietly reversed.
+    // This one really is every workflow, `publish.yml` included: it is the file
+    // most likely to acquire a token, because a token is what would make a
+    // failing OIDC publish start working.
     for (const { name, source } of workflowSources()) {
       expect(source, `${name} references an npm token`).not.toMatch(
         /NPM_TOKEN|NODE_AUTH_TOKEN|registry\.npmjs\.org\/:_authToken/,
@@ -458,7 +842,11 @@ describe('npm publication', () => {
     expect(doc).toMatch(/whoami/);
   });
 
-  it('names the version the bootstrap publish will create', () => {
+  it('names the version the bootstrap publish created', () => {
+    // Still asserted after the fact. Which version first reached the registry
+    // is the one piece of npm history that cannot be recovered from this
+    // repository — tags say what was released, not what was published — and it
+    // is what someone reading the docs in a year will want.
     const doc = readText('docs/npm-publishing.md');
     const checklist = readText('docs/release-checklist.md');
     const version = manifest.version as string;
@@ -468,26 +856,56 @@ describe('npm publication', () => {
     expect(checklist).toContain(`v${version}`);
   });
 
-  it('uses an explicit --access public for the first scoped publish', () => {
-    // `publishConfig` sets it too, but the bootstrap is a hand-typed command
-    // run once, and a scoped package that defaults to `restricted` publishes
-    // successfully and privately. Both docs state it on the command line.
-    for (const path of ['docs/npm-publishing.md', 'docs/release-checklist.md']) {
+  it('uses an explicit --access public everywhere a publish is written down', () => {
+    // `publishConfig` sets it too, but a scoped package that defaults to
+    // `restricted` publishes successfully and privately, so both docs and the
+    // workflow state it on the command line.
+    for (const path of [
+      'docs/npm-publishing.md',
+      'docs/release-checklist.md',
+      `.github/workflows/${PUBLISH_WORKFLOW}`,
+    ]) {
       expect(readText(path), `${path} omits --access public`).toMatch(
         /npm publish --access public/,
       );
     }
   });
 
-  it('documents that the first publish cannot come from CI', () => {
+  it('documents that the first publish could not come from CI', () => {
     // npm configures a trusted publisher in a package's settings, so a package
-    // that does not exist yet cannot have one. The first version has to be
-    // published by hand. Automation designed without knowing this fails at the
-    // one moment it is first used.
+    // that does not exist yet cannot have one. The first version had to be
+    // published by hand — kept here because the constraint explains the shape
+    // of everything else, and a reader who does not know it will read the
+    // bootstrap as an oversight.
     const doc = readText('docs/npm-publishing.md');
 
     expect(doc).toMatch(/must already exist on the npm registry/i);
     expect(doc).toMatch(/manual/i);
+  });
+
+  it('documents the two settings automated publication depends on', () => {
+    // Neither can be created from this repository, and until both exist the
+    // publish workflow runs and is rejected at the last step. A reader who
+    // finds only the workflow would have no way to know that.
+    for (const path of ['docs/npm-publishing.md', 'docs/release-checklist.md']) {
+      const doc = readText(path);
+
+      expect(doc, `${path} does not name the GitHub Environment`).toMatch(/GitHub Environment/);
+      expect(doc, `${path} does not name the trusted publisher owner`).toContain('igkougkousis01');
+      expect(doc, `${path} does not name the workflow file`).toContain(PUBLISH_WORKFLOW);
+      expect(doc, `${path} does not mention the trusted publisher`).toMatch(/trusted publisher/i);
+    }
+  });
+
+  it('keeps the npm scope and the GitHub owner apart in the trust settings', () => {
+    // The single easiest thing in this project to get backwards: the trusted
+    // publisher is entirely the GitHub identity, and the npm scope appears
+    // nowhere in it. A configuration built from `@igkougkousis` would be
+    // accepted as text and would never grant anything.
+    const doc = readText('docs/npm-publishing.md');
+
+    expect(doc).toMatch(/Organization or user \| `igkougkousis01`/);
+    expect(doc).toMatch(/Workflow filename\s+\| `publish\.yml`/);
   });
 
   it('sends the release checklist to the publishing doc instead of saying "just publish"', () => {
@@ -598,38 +1016,64 @@ describe('repository hygiene', () => {
     }
   });
 
-  it('does not advertise an npm install that would not work yet', () => {
-    // The package is not published. A copy-pasteable `npm install -g` line
-    // would send a stranger to whatever else is on the registry under that
-    // name — and under the unscoped name, something else really is there.
+  it('never advertises an install of the unscoped name, which is someone else', () => {
+    // `chaos-proxy` on the registry is a different project by another
+    // maintainer. A copy-pasteable line without the scope sends a stranger to
+    // their package, and it looks exactly like the right command.
     const readme = readText('README.md');
+
     expect(readme).not.toMatch(/^\s*npm install (-g |--global )?chaos-proxy\s*$/m);
+    expect(readme).not.toMatch(/^\s*npx chaos-proxy\b/m);
   });
 
-  it('still says the package is not on the registry', () => {
-    // The scoped name is decided and written down everywhere, which is exactly
-    // the state in which the README starts reading as though publication had
-    // happened. It has not. This has to be flipped deliberately, after the
-    // first publish, and not drift there on its own.
+  it('says the package is on the registry, because it now is', () => {
+    // The inverse of what this asserted until `1.0.2` was published, and
+    // flipped deliberately rather than by drift: for three versions the README
+    // had to keep saying the package was not available, because it was not.
+    // Now the failure mode is the opposite one — a README that still tells a
+    // reader to clone when `npm install` works — so that is what is asserted.
     const readme = readText('README.md');
 
-    expect(readme).toMatch(/not (yet )?(on npm|published)/i);
+    expect(readme).not.toMatch(/not (yet )?(on npm|published|available)/i);
     expect(readme).toContain('@igkougkousis/chaos-proxy');
   });
 
   it('says it in the install section itself, not only in passing elsewhere', () => {
-    // The assertion above is satisfied by any sentence anywhere in a 40kB
-    // README, and two early ones satisfy it. So flipping the `### From npm`
-    // heading to claim availability leaves the file contradicting itself and
-    // the check above still passing — which was true until this test existed.
-    // The claim that matters is the one directly above the `npm install` line a
-    // reader is about to copy, so that is what is asserted.
+    // The assertion above is satisfied by the absence of a sentence anywhere in
+    // a 40kB README. The claim that matters is the one directly above the
+    // `npm install` line a reader is about to copy, so that is what is
+    // asserted: a `### From npm` section that gives the command without
+    // disclaiming it.
     const readme = readText('README.md');
-    const section = /^### From npm$([\s\S]*?)(?=^## )/m.exec(readme)?.[1];
+    const section = /^### From npm$([\s\S]*?)(?=^### |^## )/m.exec(readme)?.[1] ?? '';
 
-    expect(section, 'README has no `### From npm` section').toBeDefined();
-    expect(section ?? '').toMatch(/not available yet/i);
-    expect(section ?? '').toContain('npm install -g @igkougkousis/chaos-proxy');
+    expect(section, 'README has no `### From npm` section').not.toBe('');
+    expect(section).not.toMatch(/not available yet|once it is published|will be published/i);
+    expect(section).toContain('npm install -g @igkougkousis/chaos-proxy');
+  });
+
+  it('gives the three ways in one place: global, npx, and as a dependency', () => {
+    // A CLI that is also a library. Someone arriving for one of those should
+    // not have to read the other's section to find their command, and the
+    // scoped specifier is the part that is easy to get wrong in all three.
+    const readme = readText('README.md');
+
+    expect(readme).toContain('npm install -g @igkougkousis/chaos-proxy');
+    expect(readme).toContain('npx @igkougkousis/chaos-proxy');
+    expect(readme).toMatch(/^npm install @igkougkousis\/chaos-proxy$/m);
+    expect(readme).toContain("import { createProxyServer } from '@igkougkousis/chaos-proxy';");
+  });
+
+  it('keeps the command unscoped even though the package is not', () => {
+    // The distinction a reader trips over: `npm install -g` puts a plain
+    // `chaos-proxy` on the PATH, because `bin` names are not namespaced. Every
+    // documented invocation in the rest of the README depends on that being
+    // said once, near the install line.
+    const readme = readText('README.md');
+    const section = /^### From npm$([\s\S]*?)(?=^### |^## )/m.exec(readme)?.[1] ?? '';
+
+    expect(section).toMatch(/^chaos-proxy --target/m);
+    expect(section).toMatch(/CLI executable\s+\|\s+`chaos-proxy`/);
   });
 
   it('advertises the npm package under the scope that can actually be published', () => {
