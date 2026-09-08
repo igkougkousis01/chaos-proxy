@@ -129,6 +129,30 @@ describe('licence', () => {
   });
 });
 
+describe('release version', () => {
+  const version = manifest.version as string;
+
+  it('is stated identically in the lockfile', () => {
+    // `npm ci` installs from the lockfile, and a lockfile that disagrees with
+    // the manifest is a version the release workflow would verify but never
+    // install.
+    const lockfile = readJson('package-lock.json');
+    const root = (lockfile.packages as Record<string, Record<string, unknown>>)[''];
+
+    expect(lockfile.version).toBe(version);
+    expect(root?.version).toBe(version);
+  });
+
+  it('has a dated changelog entry, with `Unreleased` still open above it', () => {
+    const changelog = readText('CHANGELOG.md');
+
+    expect(changelog).toMatch(
+      new RegExp(`^## \\[${version.replace(/\./g, '\\.')}\\] - \\d{4}-\\d{2}-\\d{2}$`, 'm'),
+    );
+    expect(changelog).toMatch(/^## \[Unreleased\]$/m);
+  });
+});
+
 describe('release tag verifier', () => {
   const script = fileURLToPath(new URL('scripts/verify-release-tag.mjs', repoRoot));
   const version = manifest.version as string;

@@ -6,13 +6,13 @@
 
 A local developer tool for testing how an application behaves when its API misbehaves.
 
-> **Status: under development.** Chaos Proxy runs from the command line and can forward HTTP
-> traffic to a target API, inject a fixed artificial latency, inject synthetic HTTP errors, inject
-> synthetic timeouts, and abruptly reset client connections — globally, or per endpoint through a
-> YAML config file — printing one line per request as it goes. A `chaos.yml` in the working
-> directory is picked up automatically, and `--print-config` shows the configuration a run would
-> use without starting anything. Named presets cover the common scenarios, and `--seed` makes a run
-> reproducible. Refusing connections outright and mid-stream failures do not exist yet.
+> Chaos Proxy runs from the command line and can forward HTTP traffic to a target API, inject a
+> fixed artificial latency, inject synthetic HTTP errors, inject synthetic timeouts, and abruptly
+> reset client connections — globally, or per endpoint through a YAML config file — printing one
+> line per request as it goes. A `chaos.yml` in the working directory is picked up automatically,
+> and `--print-config` shows the configuration a run would use without starting anything. Named
+> presets cover the common scenarios, and `--seed` makes a run reproducible. Refusing connections
+> outright and mid-stream failures do not exist yet.
 
 Chaos Proxy sits between an application and an API and deliberately degrades that connection, so
 that loading states, retries, error handling, and timeout behaviour can be exercised locally.
@@ -88,10 +88,11 @@ node dist/cli.js --target http://localhost:3000
 ### From npm
 
 Not available yet. There is no `chaos-proxy` package on the registry to install, so do not expect
-`npm install -g chaos-proxy` to give you this tool. When the first release is published, this
-section will say so and the command will be here — until then, the clone above is the only way to
-get it. See [docs/release-checklist.md](docs/release-checklist.md) for where publishing sits in the
-release process.
+`npm install -g chaos-proxy` to give you this tool. Publishing to the registry is a separate step
+from cutting a release, and it has not happened: when it does, this section will say so and the
+command will be here. Until then, the clone above is the only way to get it. See
+[docs/release-checklist.md](docs/release-checklist.md) for where publishing sits in the release
+process.
 
 ## Usage
 

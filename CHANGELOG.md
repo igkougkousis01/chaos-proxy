@@ -5,11 +5,12 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-Nothing has been released yet. `0.1.0` is the version the manifest has carried through
-development; it has never been tagged or published. Everything below is therefore unreleased, and
-the first public release will be `1.0.0`.
+There is no `0.1.0` entry below. That was the version the manifest carried through development; it
+was never tagged and never published, so `1.0.0` is the first release.
 
 ## [Unreleased]
+
+## [1.0.0] - 2026-09-08
 
 ### Added
 
@@ -34,6 +35,15 @@ the first public release will be `1.0.0`.
 - Graceful shutdown on `SIGINT` and `SIGTERM`, letting requests in flight finish.
 - A programmatic API: `createProxyServer`, with optional `resolveChaos` and `onRequestComplete`
   hooks.
+- CLI diagnostics written for the person who typed the command: `--help` lists every flag with its
+  default, a mistyped flag or out-of-range value is reported on its own with a pointer to `--help`,
+  and an unrecognised config field is reported alongside the fields that do exist.
+- A packaging smoke test (`npm run package:smoke`) that packs the tarball, installs it into an
+  empty project outside the repository, and drives the installed copy — CLI, public API, a
+  forwarded request, an injected failure and signal shutdown.
+- Release automation: a tag-triggered workflow that checks the tag against the manifest version,
+  runs the quality gate and the smoke test, packs the tarball and attaches it to a GitHub Release.
+  Publishing to npm is deliberately not part of it.
 
 ### Security
 
@@ -41,4 +51,5 @@ the first public release will be `1.0.0`.
 - Request logging reports method, path, status, duration and outcome. Headers, cookies,
   authorization and bodies are never logged.
 
-[unreleased]: https://github.com/igkougkousis01/chaos-proxy/commits/main
+[unreleased]: https://github.com/igkougkousis01/chaos-proxy/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/igkougkousis01/chaos-proxy/releases/tag/v1.0.0
