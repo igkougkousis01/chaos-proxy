@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { parse as parseYaml } from 'yaml';
@@ -347,6 +347,71 @@ describe('release workflow', () => {
   });
 });
 
+describe('npm publication', () => {
+  // The registry name `chaos-proxy` belongs to another maintainer, and their
+  // own `1.0.0` is already published and immutable. Publication is therefore
+  // blocked on a naming decision that only the maintainer can make, and these
+  // assertions keep the repository honest about that until it is made. They
+  // are all offline: nothing here contacts the registry or needs credentials.
+
+  function workflowSources(): { name: string; source: string }[] {
+    const dir = new URL('.github/workflows/', repoRoot);
+
+    return readdirSync(dir)
+      .filter((name) => name.endsWith('.yml') || name.endsWith('.yaml'))
+      .map((name) => ({ name, source: readText(`.github/workflows/${name}`) }));
+  }
+
+  it('has no workflow that publishes to the registry', () => {
+    // Deliberately every workflow, not just `release.yml`: the failure this
+    // guards against is a *new* workflow being added that publishes, which an
+    // assertion naming one file by hand would not see.
+    for (const { name, source } of workflowSources()) {
+      expect(source, `${name} runs npm publish`).not.toMatch(/npm\s+publish(?!.*--dry-run)/);
+    }
+  });
+
+  it('has no workflow that references a long-lived npm token', () => {
+    // Trusted publishing exists so that no such credential has to exist. A
+    // token appearing in a workflow means that decision was quietly reversed.
+    for (const { name, source } of workflowSources()) {
+      expect(source, `${name} references an npm token`).not.toMatch(
+        /NPM_TOKEN|NODE_AUTH_TOKEN|registry\.npmjs\.org\/:_authToken/,
+      );
+    }
+  });
+
+  it('declares public access, which a scoped fallback name would require', () => {
+    // Unscoped, this is npm's default. Scoped — `@igkougkousis01/chaos-proxy`
+    // is the obvious way out of the name conflict — the default is *private*,
+    // and a rename without this would either fail or publish a private package.
+    expect(manifest.publishConfig).toEqual({ access: 'public' });
+  });
+
+  it('documents the name conflict rather than leaving it to be rediscovered', () => {
+    const doc = readText('docs/npm-publishing.md');
+
+    expect(doc).toContain('gkoos');
+    expect(doc).toMatch(/immutable/i);
+  });
+
+  it('documents that the first publish cannot come from CI', () => {
+    // npm configures a trusted publisher in a package's settings, so a package
+    // that does not exist yet cannot have one. The first version has to be
+    // published by hand. Automation designed without knowing this fails at the
+    // one moment it is first used.
+    const doc = readText('docs/npm-publishing.md');
+
+    expect(doc).toMatch(/must already exist on the npm registry/i);
+    expect(doc).toMatch(/manual/i);
+  });
+
+  it('sends the release checklist to the publishing doc instead of saying "just publish"', () => {
+    const checklist = readText('docs/release-checklist.md');
+    expect(checklist).toContain('npm-publishing.md');
+  });
+});
+
 describe('repository hygiene', () => {
   it('ignores packed tarballs, so a manual `npm pack` cannot be committed', () => {
     expect(readText('.gitignore')).toContain('*.tgz');
@@ -359,6 +424,7 @@ describe('repository hygiene', () => {
       'SECURITY.md',
       'SUPPORT.md',
       'docs/release-checklist.md',
+      'docs/npm-publishing.md',
     ]) {
       expect(() => readText(file), `missing: ${file}`).not.toThrow();
     }

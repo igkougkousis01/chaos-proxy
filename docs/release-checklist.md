@@ -24,10 +24,11 @@ reviewable change immediately before the tag.
 5. **The release workflow runs** on that tag: it verifies the tag against the manifest, runs the
    full quality gate, runs the package smoke test, packs the tarball, and creates the GitHub
    Release with `chaos-proxy-1.0.0.tgz` attached.
-6. **Publish to npm, when the registry side is ready.** This is not automated and no npm token
-   exists in this repository. When the name is owned and `npm whoami` is the right account:
-   `npm publish` from a clean checkout of the tag. `prepack` rebuilds `dist/` first, so a stale
-   build cannot be published.
+6. **Publish to npm — currently blocked.** This is not automated and no npm token exists in this
+   repository. It is also not currently possible: the name `chaos-proxy` on npm belongs to another
+   maintainer and their own `1.0.0` is already published, so the name has to be settled before
+   anything can ship. See [npm publishing](npm-publishing.md) for the conflict, the one manual
+   bootstrap publish npm requires before OIDC can take over, and the trusted-publisher setup.
 
 ## Rehearsing it
 
